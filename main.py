@@ -1,9 +1,10 @@
 # ==========================================================
-# OptionExecutor v1.9.2 — NYSE/NASDAQ + $5 floor, Alpaca Screener + Tradier Options
-# - Universe: Alpaca /v2/assets filtered to exchanges {NYSE, NASDAQ}
-# - Price floor: last close >= $5 (checked during Alpaca bars fetch)
+# OptionExecutor v1.9.3 — All Alpaca US equities (no price floor) + Tradier options
+# - Universe: ALL Alpaca active us_equity (no exchange/price filters)
 # - Screener: EMA20>EMA50 & RSI>50 rising (daily)
-# - Options: Tradier chains with greeks flattened; buy/sell same as before
+# - Options: Tradier chains with greeks flattened; 1 req/sec throttle
+# - Buy/Sell logic unchanged (ATR chandelier trail, drawdown, time-based exit)
+# - Set DEBUG=true for verbose progress + reasons
 # ==========================================================
 
 import os, json, sqlite3, time, requests, pandas as pd
@@ -56,10 +57,6 @@ class S:
     # --- Indicators ---
     EMA_FAST, EMA_SLOW, RSI_LEN = _i("EMA_FAST", 20), _i("EMA_SLOW", 50), _i("RSI_LEN", 14)
     ATR_LEN, TRAIL_K, OPT_DD, DTE_STOP = _i("ATR_LEN", 14), _f("TRAIL_K_ATR", 3.0), _f("OPT_DD_EXIT", 0.25), _i("DTE_STOP", 7)
-
-    # --- Universe trims you asked for ---
-    ALLOWED_EXCHANGES = [s.strip().upper() for s in os.getenv("ALLOWED_EXCHANGES", "NYSE,NASDAQ").split(",")]
-    MIN_PRICE         = _f("MIN_PRICE", 5.0)   # last close floor
 
     # --- Orders / persistence ---
     QTY = _i("ORDER_QTY", 1)
@@ -171,9 +168,9 @@ def db_del(c):
     con.commit(); con.close()
 
 # -------------------- Alpaca Universe + Per-symbol Bars --------------------
-def alpaca_universe_filtered() -> List[str]:
+def alpaca_universe_all() -> List[str]:
     """
-    Pull all active US equities from Alpaca, then keep only ALLOWED_EXCHANGES (NYSE, NASDAQ by default).
+    All active US equities from Alpaca /v2/assets. Requires API keys.
     """
     if not (S.ALPACA_KEY and S.ALPACA_SECRET):
         print("[ERROR] Alpaca keys missing (APCA_API_KEY_ID/APCA_API_SECRET_KEY).")
@@ -185,17 +182,14 @@ def alpaca_universe_filtered() -> List[str]:
     syms = []
     for a in data:
         sym = a.get("symbol")
-        exch = (a.get("exchange") or "").upper()
         tradable = a.get("tradable", True)
-        if sym and tradable and exch in S.ALLOWED_EXCHANGES:
+        if sym and tradable:
             syms.append(sym.upper())
     # dedup preserve order
     seen=set(); out=[]
     for s in syms:
         if s not in seen:
             out.append(s); seen.add(s)
-    if DEBUG:
-        print(f"[INFO] Universe after exchange filter {S.ALLOWED_EXCHANGES}: {len(out)} symbols")
     return out
 
 def alpaca_history_daily_symbol(symbol: str, days: int = 420) -> pd.DataFrame:
@@ -247,7 +241,7 @@ def tradier_chain(sym: str, exp: str) -> pd.DataFrame:
     """
     d = _tradier_get("/v1/markets/options/chains", {"symbol": sym, "expiration": exp, "greeks": "true"})
     o = (d.get("options") or {}).get("option")
-    if not o: 
+    if not o:
         return pd.DataFrame()
     df = pd.DataFrame(o)
 
@@ -414,19 +408,15 @@ def screen_symbol_via_alpaca(sym: str) -> bool:
     if df.empty:
         if DEBUG: print(f"[SKIP] {sym}: no bars")
         return False
-    last_close = float(df["Close"].iloc[-1])
-    if last_close < S.MIN_PRICE:
-        if DEBUG: print(f"[SKIP] {sym}: last close {last_close:.2f} < ${S.MIN_PRICE:.2f}")
-        return False
     passed = trend_ok(df)
     if DEBUG:
         if passed:
             r = rsi(df["Close"], S.RSI_LEN).iloc[-1]
             ef = ema(df["Close"], S.EMA_FAST).iloc[-1]
             es = ema(df["Close"], S.EMA_SLOW).iloc[-1]
-            print(f"[PASS] {sym}: Close={last_close:.2f}, EMA20={ef:.2f}>EMA50={es:.2f}, RSI={r:.1f}")
+            print(f"[PASS] {sym}: EMA20={ef:.2f}>EMA50={es:.2f}, RSI={r:.1f}")
         else:
-            print(f"[FAIL] {sym}: trend not confirmed (Close={last_close:.2f})")
+            print(f"[FAIL] {sym}: trend not confirmed")
     return passed
 
 # -------------------- Runner --------------------
@@ -440,11 +430,11 @@ def run_once():
 
     db_init()
 
-    # 1) Universe: Alpaca assets → filter to NYSE/NASDAQ (or ALLOWED_EXCHANGES)
-    syms = alpaca_universe_filtered()
-    print(f"[INFO] Universe after exchange filter: {len(syms)} symbols")
+    # 1) Universe: Alpaca assets (ALL active US equities)
+    syms = alpaca_universe_all()
+    print(f"[INFO] Universe (Alpaca active us_equity): {len(syms)} symbols")
 
-    # 2) Screen each symbol via Alpaca (EMA/RSI) with $5 price floor
+    # 2) Screen each symbol via Alpaca (EMA/RSI)
     candidates: List[str] = []
     for i, sym in enumerate(syms, 1):
         try:
