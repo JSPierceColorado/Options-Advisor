@@ -1,7 +1,7 @@
 # ==========================================================
-# OptionExecutor v2.2 — S&P 500 Screener (Alpaca) → Options (Tradier)
-# - Universe: S&P 500 only (scraped from Wikipedia with UA; small hardcoded fallback)
-# - Screener: EMA20 > EMA50 and RSI(14) > 50 and rising (daily bars via Alpaca)
+# OptionExecutor v2.2.1 — S&P 500 via CSV mirrors (no lxml) → Alpaca screener → Tradier options
+# - S&P 500 list fetched from CSV mirrors (GitHub/DataHub). No pandas.read_html, no lxml needed.
+# - Screener: EMA20 > EMA50 & RSI(14) > 50 rising (daily bars via Alpaca)
 # - Options: Tradier chains (greeks flattened). Correct order fields:
 #       symbol=<UNDERLYING>, option_symbol=<OCC>
 # - Throttling: Alpaca delay & Tradier ~1 req/sec
@@ -34,7 +34,7 @@ class S:
     ALPACA_KEY       = os.getenv("APCA_API_KEY_ID", "")
     ALPACA_SECRET    = os.getenv("APCA_API_SECRET_KEY", "")
     ALPACA_DATA_BASE = os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.markets")  # stocks bars
-    ALPACA_API_DELAY = _f("ALPACA_API_DELAY", 0.20)  # per request; tweak if you need more/less speed
+    ALPACA_API_DELAY = _f("ALPACA_API_DELAY", 0.20)  # per request
     ALPACA_FEED      = os.getenv("ALPACA_FEED", "iex")  # 'iex' (free) or 'sip' (paid)
 
     # --- Tradier (orders + options data) ---
@@ -70,7 +70,7 @@ def _alpaca_headers():
         "APCA-API-KEY-ID": S.ALPACA_KEY,
         "APCA-API-SECRET-KEY": S.ALPACA_SECRET,
         "Accept": "application/json",
-        "User-Agent": "OptionExecutor/2.2 (+S&P500 screener)"
+        "User-Agent": "OptionExecutor/2.2.1 (+S&P500 screener)"
     }
 
 def _alpaca_get(path, params=None):
@@ -89,7 +89,7 @@ def _tradier_headers():
     return {
         "Authorization": f"Bearer {S.TRADIER_TOKEN}",
         "Accept": "application/json",
-        "User-Agent": "OptionExecutor/2.2"
+        "User-Agent": "OptionExecutor/2.2.1"
     }
 
 def _tradier_get(path, params=None):
@@ -169,53 +169,54 @@ def db_del(c):
     con.execute("DELETE FROM picks WHERE contract=?", (c,))
     con.commit(); con.close()
 
-# -------------------- S&P 500 universe --------------------
+# -------------------- S&P 500 universe (CSV mirrors; no lxml) --------------------
 _FALLBACK_SP500 = [
-    # Tiny fallback subset in case scraping fails hard (still functional)
+    # Tiny fallback subset in case all remote sources fail
     "AAPL","MSFT","AMZN","GOOGL","META","NVDA","BRK.B","JPM","JNJ","XOM",
     "V","PG","MA","AVGO","HD","KO","PEP","PFE","ABBV","BAC"
 ]
 
+_SP500_SOURCES = [
+    # GitHub dataset (commonly mirrored)
+    "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
+    # DataHub mirror
+    "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv",
+]
+
 def sp500_symbols() -> List[str]:
-    """
-    Scrape the S&P 500 ticker list (Wikipedia).
-    Uses a desktop User-Agent to reduce 403s.
-    Falls back to a small hardcoded set if it cannot fetch.
-    """
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    }
-    try:
-        html = requests.get(url, headers=headers, timeout=30).text
-        tables = pd.read_html(html)
-        # The first table usually contains the constituents
-        df = tables[0]
-        # Ticker column can be named differently; try common variants
-        for col in ["Symbol", "Ticker symbol", "Ticker"]:
-            if col in df.columns:
-                syms = [str(x).strip().upper().replace(" ", "") for x in df[col].tolist()]
-                # Wikipedia sometimes has "." vs "·" or notes; clean a bit
-                syms = [s.replace("\u200a", "").replace("\u00b7",".") for s in syms]
-                # Dedup while preserving order
-                seen=set(); out=[]
-                for s in syms:
-                    if s and s not in seen:
-                        out.append(s); seen.add(s)
-                if DEBUG:
-                    print(f"[INFO] S&P 500 scraped: {len(out)} symbols")
-                return out
-        print("[WARN] S&P 500: expected ticker column not found; using fallback")
-    except Exception as e:
-        print(f"[WARN] Could not scrape S&P 500 list: {e}; using fallback")
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": "Mozilla/5.0 OptionExecutor/2.2.1"})
+    for src in _SP500_SOURCES:
+        try:
+            r = sess.get(src, timeout=30)
+            r.raise_for_status()
+            text = r.text
+            # Parse CSV manually to avoid pandas.read_csv edge deps if you want
+            # but pandas.read_csv is fine (no lxml required)
+            from io import StringIO
+            df = pd.read_csv(StringIO(text))
+            # Column might be 'Symbol' or 'Ticker'
+            for col in ["Symbol", "Ticker", "symbol", "ticker"]:
+                if col in df.columns:
+                    syms = [str(x).strip().upper().replace(" ", "") for x in df[col].tolist()]
+                    # Normalize weird unicode and dots
+                    syms = [s.replace("\u200a", "").replace("\u00b7",".") for s in syms]
+                    # Dedup preserve order
+                    seen=set(); out=[]
+                    for s in syms:
+                        if s and s not in seen:
+                            out.append(s); seen.add(s)
+                    if len(out) >= 450:  # sanity: should be near 500
+                        if DEBUG:
+                            print(f"[INFO] S&P 500 fetched from {src}: {len(out)} symbols")
+                        return out
+        except Exception as e:
+            print(f"[WARN] S&P 500 fetch failed from {src}: {e}")
+    print("[WARN] Using small S&P 500 fallback list")
     return _FALLBACK_SP500[:]
 
 # -------------------- Alpaca (per-symbol daily bars) --------------------
 def alpaca_history_daily_symbol(symbol: str, days: int = 420) -> pd.DataFrame:
-    """
-    Fetch 1Day bars for a single symbol via data.alpaca.markets.
-    """
     start = (datetime.now(UTC) - timedelta(days=days+10)).isoformat()
     params = {
         "timeframe": "1Day",
@@ -253,26 +254,16 @@ def tradier_expirations(sym: str) -> List[str]:
     return e if isinstance(e, list) else ([e] if e else [])
 
 def tradier_chain(sym: str, exp: str) -> pd.DataFrame:
-    """
-    Get chain with greeks and FLATTEN the greeks dict into top-level columns:
-    - delta, gamma, theta, vega, iv
-    """
     d = _tradier_get("/v1/markets/options/chains", {"symbol": sym, "expiration": exp, "greeks": "true"})
     o = (d.get("options") or {}).get("option")
     if not o: 
         return pd.DataFrame()
     df = pd.DataFrame(o)
-
-    # numeric normals
     for c in ["strike","bid","ask","volume","open_interest","last","change"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # Some payloads use 'type' instead of 'option_type'
     if "option_type" not in df.columns and "type" in df.columns:
         df["option_type"] = df["type"]
-
-    # FLATTEN GREEKS
     if "greeks" in df.columns:
         g = df["greeks"].apply(lambda x: x if isinstance(x, dict) else {})
         df["delta"] = pd.to_numeric(g.apply(lambda x: x.get("delta")), errors="coerce")
@@ -280,7 +271,6 @@ def tradier_chain(sym: str, exp: str) -> pd.DataFrame:
         df["theta"] = pd.to_numeric(g.apply(lambda x: x.get("theta")), errors="coerce")
         df["vega"]  = pd.to_numeric(g.apply(lambda x: x.get("vega")), errors="coerce")
         df["iv"]    = pd.to_numeric(g.apply(lambda x: x.get("mid_iv") if "mid_iv" in x else x.get("bid_iv") if "bid_iv" in x else x.get("ask_iv")), errors="coerce")
-
     return df
 
 def tradier_quote(sym_occ: str) -> Dict:
@@ -288,36 +278,26 @@ def tradier_quote(sym_occ: str) -> Dict:
     return (d.get("quotes") or {}).get("quote") or {}
 
 def tradier_order(underlying: str, occ_symbol: str, side: str, qty: int, otype="limit", price=None, preview=False):
-    """
-    Places a single-leg OPTION order on Tradier.
-    - underlying: e.g., "AAPL"
-    - occ_symbol: e.g., "AAPL241220C00195000"
-    """
     if S.DRY_RUN:
         print("[DRY_RUN] order", {"underlying": underlying, "occ": occ_symbol, "side": side, "qty": qty, "type": otype, "price": price})
         return {"status": "dry_run"}
-
     if not S.TRADIER_ACCOUNT:
         print("[ERROR] TRADIER_ACCOUNT is missing.")
         return {"error": "no account"}
-
     data = {
         "class": "option",
-        "symbol": underlying,          # <-- REQUIRED: underlying here
-        "option_symbol": occ_symbol,   # <-- REQUIRED: OCC symbol here
-        "side": side,                  # buy_to_open / sell_to_close
+        "symbol": underlying,
+        "option_symbol": occ_symbol,
+        "side": side,
         "quantity": str(qty),
-        "type": otype,                 # market / limit
-        "duration": S.DURATION,        # day / gtc
+        "type": otype,
+        "duration": S.DURATION,
     }
     if otype == "limit" and price is not None:
         data["price"] = f"{price:.2f}"
     if preview:
         data["preview"] = "true"
-
     resp = _tradier_post(f"/v1/accounts/{S.TRADIER_ACCOUNT}/orders", data)
-
-    # Surface any errors right in the logs
     if "errors" in resp:
         print("[TRADIER][ORDER][ERROR]", json.dumps(resp, indent=2))
     else:
@@ -356,40 +336,29 @@ def pick_call_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
     if df.empty:
         if DEBUG: print(f"[INFO] {t} {exp}: empty chain")
         return None
-
     if "option_type" not in df.columns and "type" in df.columns:
         df["option_type"] = df["type"]
-
     calls = df[df.get("option_type") == "call"].copy()
     if calls.empty: return None
-
-    # DTE filter
     try: exp_dt = datetime.fromisoformat(exp)
     except Exception: exp_dt = datetime.strptime(exp, "%Y-%m-%d")
     dte = max(0, (exp_dt.date() - today.date()).days)
     if not (S.DTE_MIN <= dte <= S.DTE_MAX):
         return None
-
-    # Ensure numeric + mid + spread
     for c in ["bid","ask","volume","open_interest","delta","strike"]:
         if c in calls.columns:
             calls[c] = pd.to_numeric(calls[c], errors="coerce")
     calls = calls[(calls["bid"] > 0) & (calls["ask"] > 0) & (calls["ask"] >= calls["bid"])]
-    if calls.empty:
-        return None
+    if calls.empty: return None
     calls["mid"] = (calls["bid"] + calls["ask"]) / 2.0
     calls["spr"] = (calls["ask"] - calls["bid"]) / calls["mid"].clip(1e-9)
-
-    # Liquidity + spread + DELTA band
     calls = calls[
         (calls["open_interest"] >= S.OI_MIN) &
         (calls["volume"] >= S.VOL_MIN) &
         (calls["spr"] <= S.MAX_SPREAD) &
         (calls["delta"].between(S.DELTA_MIN, S.DELTA_MAX))
     ]
-    if calls.empty:
-        return None
-
+    if calls.empty: return None
     target = 0.5*(S.DELTA_MIN + S.DELTA_MAX)
     calls["drank"] = (calls["delta"] - target).abs()
     best = calls.sort_values(by=["drank","spr","mid"], ascending=[True,True,False]).iloc[0]
@@ -402,7 +371,6 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
     if hist.empty: return
     spot = float(hist["Close"].iloc[-1])
     atr_val = float(atr(hist, S.ATR_LEN).iloc[-1])
-
     picks = [p for p in db_all() if p["ticker"] == t]
     for p in picks:
         hi = max(p["highest_close"], spot)
@@ -411,7 +379,6 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
         bid, ask = float(q.get("bid",0)), float(q.get("ask",0))
         mid = (bid + ask)/2 if bid>0 and ask>0 else p["entry_option"]
         peak = max(p["peak_option"], mid)
-
         reason = None
         if spot < trail: reason = "trail"
         elif mid <= peak*(1 - S.OPT_DD): reason = "drawdown"
@@ -420,7 +387,6 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
             except Exception: exp_dt = datetime.strptime(p["expiry"], "%Y-%m-%d")
             if (exp_dt.date() - datetime.now(UTC).date()).days <= S.DTE_STOP:
                 reason = "time"
-
         if reason:
             print(f"SELL {t} {p['contract']} reason={reason}")
             tradier_order(t, p["contract"], "sell_to_close", S.QTY, "market")
@@ -431,19 +397,16 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
 
 # -------------------- Candidate processing --------------------
 def process_candidate_tradier(t: str, cnt: Dict[str,int]):
-    # Underlying hist via Tradier (for ATR trail at entry)
     hist = tradier_history_daily(t, 420)
     if hist.empty:
         if DEBUG: print(f"[SKIP] {t}: no Tradier history")
         return
     spot = float(hist["Close"].iloc[-1])
     atr_val = float(atr(hist, S.ATR_LEN).iloc[-1])
-
     exps = tradier_expirations(t)
     if not exps:
         if DEBUG: print(f"[SKIP] {t}: no expirations")
         return
-
     today = datetime.now(UTC)
     best = None
     for exp in exps:
@@ -455,7 +418,6 @@ def process_candidate_tradier(t: str, cnt: Dict[str,int]):
         if DEBUG: print(f"[NO OPTIONS] {t}: no viable calls in window")
         return
     cnt["viable"] += 1
-
     limit = round(min(best.ask, best.mid * 1.02), 2)
     print(f"BUY {t} {best.contract} Δ={best.delta:.2f} @{limit}")
     tradier_order(t, best.contract, "buy_to_open", S.QTY, "limit", limit)
@@ -494,11 +456,11 @@ def run_once():
     db_init()
     sanity_check_tradier()
 
-    # 1) Universe: S&P 500 only
+    # 1) Universe: S&P 500 only (CSV mirrors)
     syms = sp500_symbols()
     print(f"[INFO] Universe: S&P 500 symbols={len(syms)}")
 
-    # 2) Screen each symbol (EMA/RSI) — much smaller & faster than full US
+    # 2) Screen each symbol (EMA/RSI)
     candidates: List[str] = []
     for i, sym in enumerate(syms, 1):
         try:
