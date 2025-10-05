@@ -1,9 +1,9 @@
 # ==========================================================
-# OptionExecutor v2.0 — Optionable-only via Tradier cache + Alpaca screener
-# - Universe: all Alpaca US equities
-# - Optionable prefilter: Tradier /v1/markets/options/expirations (cached in SQLite)
-# - Only screen EMA/RSI on symbols confirmed optionable
-# - Options + orders: Tradier (1 req/sec throttle)
+# OptionExecutor v1.9.2 — NYSE/NASDAQ + $5 floor, Alpaca Screener + Tradier Options
+# - Universe: Alpaca /v2/assets filtered to exchanges {NYSE, NASDAQ}
+# - Price floor: last close >= $5 (checked during Alpaca bars fetch)
+# - Screener: EMA20>EMA50 & RSI>50 rising (daily)
+# - Options: Tradier chains with greeks flattened; buy/sell same as before
 # ==========================================================
 
 import os, json, sqlite3, time, requests, pandas as pd
@@ -44,25 +44,26 @@ class S:
     TRADIER_BASE      = os.getenv("TRADIER_BASE", "https://sandbox.tradier.com")
     TRADIER_ACCOUNT   = os.getenv("TRADIER_ACCOUNT", "")
     TRADIER_API_DELAY = _f("TRADIER_API_DELAY", 1.00)  # 1 req/sec
-    DRY_RUN           = _b("DRY_RUN", False)
-    DURATION          = os.getenv("ORDER_DURATION", "day")
+    DRY_RUN   = _b("DRY_RUN", False)
+    DURATION  = os.getenv("ORDER_DURATION", "day")
 
     # --- Option filters ---
-    DTE_MIN, DTE_MAX     = _i("DTE_MIN", 30), _i("DTE_MAX", 60)
-    DELTA_MIN, DELTA_MAX = _f("DELTA_MIN", 0.60), _f("DELTA_MAX", 0.80)
-    OI_MIN, VOL_MIN      = _i("OI_MIN", 200), _i("VOL_MIN", 50)
-    MAX_SPREAD           = _f("MAX_SPREAD_PCT", 0.15)
+    DTE_MIN, DTE_MAX           = _i("DTE_MIN", 30), _i("DTE_MAX", 60)
+    DELTA_MIN, DELTA_MAX       = _f("DELTA_MIN", 0.60), _f("DELTA_MAX", 0.80)
+    OI_MIN, VOL_MIN            = _i("OI_MIN", 200), _i("VOL_MIN", 50)
+    MAX_SPREAD                 = _f("MAX_SPREAD_PCT", 0.15)
 
     # --- Indicators ---
     EMA_FAST, EMA_SLOW, RSI_LEN = _i("EMA_FAST", 20), _i("EMA_SLOW", 50), _i("RSI_LEN", 14)
     ATR_LEN, TRAIL_K, OPT_DD, DTE_STOP = _i("ATR_LEN", 14), _f("TRAIL_K_ATR", 3.0), _f("OPT_DD_EXIT", 0.25), _i("DTE_STOP", 7)
 
+    # --- Universe trims you asked for ---
+    ALLOWED_EXCHANGES = [s.strip().upper() for s in os.getenv("ALLOWED_EXCHANGES", "NYSE,NASDAQ").split(",")]
+    MIN_PRICE         = _f("MIN_PRICE", 5.0)   # last close floor
+
     # --- Orders / persistence ---
     QTY = _i("ORDER_QTY", 1)
     DB  = os.getenv("DB_PATH", "./executor_tradier.db")
-
-    # --- Optionable discovery budget (new symbols per run) ---
-    OPTIONABLE_CHECK_BUDGET = _i("OPTIONABLE_CHECK_BUDGET", 0)  # 0 = unlimited; set e.g. 100 if you want to cap
 
     # --- Logging ---
     VERBOSE = _b("VERBOSE", True)
@@ -147,11 +148,6 @@ def db_init():
         ticker TEXT, contract TEXT PRIMARY KEY, expiry TEXT, strike REAL,
         delta REAL, entry_underlying REAL, entry_option REAL,
         highest_close REAL, trail REAL, peak_option REAL, created_at TEXT)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS optionable (
-        symbol TEXT PRIMARY KEY,
-        is_optionable INTEGER NOT NULL,
-        checked_at TEXT NOT NULL
-    )""")
     con.commit(); con.close()
 
 def db_all():
@@ -174,35 +170,11 @@ def db_del(c):
     con.execute("DELETE FROM picks WHERE contract=?", (c,))
     con.commit(); con.close()
 
-# ------ Optionable cache helpers ------
-def optionable_get_cached(symbol: str) -> Optional[bool]:
-    con = sqlite3.connect(S.DB); con.row_factory = sqlite3.Row
-    r = con.execute("SELECT is_optionable FROM optionable WHERE symbol=?", (symbol,)).fetchone()
-    con.close()
-    if r is None: return None
-    return bool(r["is_optionable"])
-
-def optionable_set(symbol: str, is_opt: bool):
-    con = sqlite3.connect(S.DB)
-    con.execute(
-        "INSERT OR REPLACE INTO optionable(symbol, is_optionable, checked_at) VALUES(?,?,?)",
-        (symbol, 1 if is_opt else 0, datetime.now(UTC).isoformat()),
-    )
-    con.commit(); con.close()
-
-def tradier_is_optionable(symbol: str) -> bool:
-    # If expirations list is non-empty → it’s optionable.
-    d = _tradier_get("/v1/markets/options/expirations", {
-        "symbol": symbol,
-        "includeAllRoots": "true",
-        "strikes": "false"
-    })
-    e = (d.get("expirations") or {}).get("date")
-    if isinstance(e, list): return len(e) > 0
-    return e is not None
-
 # -------------------- Alpaca Universe + Per-symbol Bars --------------------
-def alpaca_universe_all() -> List[str]:
+def alpaca_universe_filtered() -> List[str]:
+    """
+    Pull all active US equities from Alpaca, then keep only ALLOWED_EXCHANGES (NYSE, NASDAQ by default).
+    """
     if not (S.ALPACA_KEY and S.ALPACA_SECRET):
         print("[ERROR] Alpaca keys missing (APCA_API_KEY_ID/APCA_API_SECRET_KEY).")
         return []
@@ -213,16 +185,23 @@ def alpaca_universe_all() -> List[str]:
     syms = []
     for a in data:
         sym = a.get("symbol")
+        exch = (a.get("exchange") or "").upper()
         tradable = a.get("tradable", True)
-        if sym and tradable:
+        if sym and tradable and exch in S.ALLOWED_EXCHANGES:
             syms.append(sym.upper())
+    # dedup preserve order
     seen=set(); out=[]
     for s in syms:
         if s not in seen:
             out.append(s); seen.add(s)
+    if DEBUG:
+        print(f"[INFO] Universe after exchange filter {S.ALLOWED_EXCHANGES}: {len(out)} symbols")
     return out
 
 def alpaca_history_daily_symbol(symbol: str, days: int = 420) -> pd.DataFrame:
+    """
+    Fetch 1Day bars for a single symbol via data.alpaca.markets.
+    """
     start = (datetime.now(UTC) - timedelta(days=days+10)).isoformat()
     params = {
         "timeframe": "1Day",
@@ -245,20 +224,39 @@ def alpaca_history_daily_symbol(symbol: str, days: int = 420) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df[["date","High","Low","Close","Volume"]].set_index("date").sort_index()
 
-# -------------------- Tradier chains/orders --------------------
+# -------------------- Tradier market data & orders --------------------
+def tradier_history_daily(symbol: str, days: int = 420) -> pd.DataFrame:
+    start = (datetime.now(UTC) - timedelta(days=days+10)).date().isoformat()
+    d = _tradier_get("/v1/markets/history", {"symbol": symbol, "interval": "daily", "start": start})
+    h = (d.get("history") or {}).get("day")
+    if not h: return pd.DataFrame()
+    df = pd.DataFrame(h); df["date"] = pd.to_datetime(df["date"])
+    for c in ["open","high","low","close","volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.rename(columns={"high":"High","low":"Low","close":"Close","volume":"Volume"}).set_index("date").sort_index()
+
+def tradier_expirations(sym: str) -> List[str]:
+    d = _tradier_get("/v1/markets/options/expirations", {"symbol": sym, "includeAllRoots": "true", "strikes": "false"})
+    e = (d.get("expirations") or {}).get("date")
+    return e if isinstance(e, list) else ([e] if e else [])
+
 def tradier_chain(sym: str, exp: str) -> pd.DataFrame:
+    """
+    Get chain with greeks and FLATTEN the greeks dict into top-level columns:
+    - delta, gamma, theta, vega, iv
+    """
     d = _tradier_get("/v1/markets/options/chains", {"symbol": sym, "expiration": exp, "greeks": "true"})
     o = (d.get("options") or {}).get("option")
     if not o: 
         return pd.DataFrame()
     df = pd.DataFrame(o)
 
-    # normalize likely numeric columns
+    # numeric normals
     for c in ["strike","bid","ask","volume","open_interest","last","change"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Some payloads use 'type' not 'option_type'
+    # Some payloads use 'type' instead of 'option_type'
     if "option_type" not in df.columns and "type" in df.columns:
         df["option_type"] = df["type"]
 
@@ -272,21 +270,6 @@ def tradier_chain(sym: str, exp: str) -> pd.DataFrame:
         df["iv"]    = pd.to_numeric(g.apply(lambda x: x.get("mid_iv") if "mid_iv" in x else x.get("bid_iv") if "bid_iv" in x else x.get("ask_iv")), errors="coerce")
 
     return df
-
-def tradier_expirations(sym: str) -> List[str]:
-    d = _tradier_get("/v1/markets/options/expirations", {"symbol": sym, "includeAllRoots": "true", "strikes": "false"})
-    e = (d.get("expirations") or {}).get("date")
-    return e if isinstance(e, list) else ([e] if e else [])
-
-def tradier_history_daily(symbol: str, days: int = 420) -> pd.DataFrame:
-    start = (datetime.now(UTC) - timedelta(days=days+10)).date().isoformat()
-    d = _tradier_get("/v1/markets/history", {"symbol": symbol, "interval": "daily", "start": start})
-    h = (d.get("history") or {}).get("day")
-    if not h: return pd.DataFrame()
-    df = pd.DataFrame(h); df["date"] = pd.to_datetime(df["date"])
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.rename(columns={"high":"High","low":"Low","close":"Close","volume":"Volume"}).set_index("date").sort_index()
 
 def tradier_quote(sym_occ: str) -> Dict:
     d = _tradier_get("/v1/markets/quotes", {"symbols": sym_occ})
@@ -308,32 +291,10 @@ def tradier_order(sym_occ: str, side: str, qty: int, otype="limit", price=None):
         data["price"]=f"{price:.2f}"
     return _tradier_post(f"/v1/accounts/{S.TRADIER_ACCOUNT}/orders", data)
 
-# -------------------- Indicators --------------------
-def ema_series(s, n): return s.ewm(span=n, adjust=False).mean()
-def rsi_series(s, n=14):
-    d = s.diff(); up, dn = d.clip(lower=0), -d.clip(upper=0)
-    rs = up.ewm(alpha=1/n, adjust=False).mean() / (dn.ewm(alpha=1/n, adjust=False).mean() + 1e-9)
-    return 100 - 100/(1+rs)
-
-def atr(df, n=14):
-    h, l, c = df["High"], df["Low"], df["Close"]; p = c.shift(1)
-    tr = pd.concat([(h-l).abs(), (h-p).abs(), (l-p).abs()], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
-
-def chandelier(high, atrv): return high - S.TRAIL_K * atrv
-
-# -------------------- Strategy helpers --------------------
+# -------------------- Options selection --------------------
 @dataclass
 class Pick:
     ticker: str; contract: str; expiry: str; strike: float; bid: float; ask: float; mid: float; delta: float; dte: int
-
-def trend_ok(df):
-    if df.empty or len(df) < max(S.EMA_SLOW+5, S.RSI_LEN+5):
-        return False
-    c = df["Close"]
-    ef, es = ema_series(c, S.EMA_FAST), ema_series(c, S.EMA_SLOW)
-    r = rsi_series(c, S.RSI_LEN)
-    return (ef.iloc[-1] > es.iloc[-1]) and (r.iloc[-1] > 50) and (r.iloc[-1] >= r.iloc[-2])
 
 def pick_call_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
     df = tradier_chain(t, exp)
@@ -347,25 +308,32 @@ def pick_call_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
     calls = df[df.get("option_type") == "call"].copy()
     if calls.empty: return None
 
-    try: exp_dt = datetime.fromisoformat(exp)
-    except Exception: exp_dt = datetime.strptime(exp, "%Y-%m-%d")
+    try:
+        exp_dt = datetime.fromisoformat(exp)
+    except Exception:
+        exp_dt = datetime.strptime(exp, "%Y-%m-%d")
     dte = max(0, (exp_dt.date() - today.date()).days)
-    if not (S.DTE_MIN <= dte <= S.DTE_MAX): return None
+    if not (S.DTE_MIN <= dte <= S.DTE_MAX):
+        return None
 
     for c in ["bid","ask","volume","open_interest","delta","strike"]:
         if c in calls.columns:
             calls[c] = pd.to_numeric(calls[c], errors="coerce")
     calls = calls[(calls["bid"] > 0) & (calls["ask"] > 0) & (calls["ask"] >= calls["bid"])]
-    if calls.empty: return None
+    if calls.empty:
+        return None
     calls["mid"] = (calls["bid"] + calls["ask"]) / 2.0
     calls["spr"] = (calls["ask"] - calls["bid"]) / calls["mid"].clip(1e-9)
+
     calls = calls[
         (calls["open_interest"] >= S.OI_MIN) &
         (calls["volume"] >= S.VOL_MIN) &
         (calls["spr"] <= S.MAX_SPREAD) &
         (calls["delta"].between(S.DELTA_MIN, S.DELTA_MAX))
     ]
-    if calls.empty: return None
+    if calls.empty:
+        return None
+
     target = 0.5*(S.DELTA_MIN + S.DELTA_MAX)
     calls["drank"] = (calls["delta"] - target).abs()
     best = calls.sort_values(by=["drank","spr","mid"], ascending=[True,True,False]).iloc[0]
@@ -379,10 +347,7 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
     spot = float(hist["Close"].iloc[-1])
     atr_val = float(atr(hist, S.ATR_LEN).iloc[-1])
 
-    con = sqlite3.connect(S.DB); con.row_factory = sqlite3.Row
-    picks = [dict(r) for r in con.execute("SELECT * FROM picks WHERE ticker=?", (t,))]
-    con.close()
-
+    picks = [p for p in db_all() if p["ticker"] == t]
     for p in picks:
         hi = max(p["highest_close"], spot)
         trail = chandelier(hi, atr_val)
@@ -395,8 +360,10 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
         if spot < trail: reason = "trail"
         elif mid <= peak*(1 - S.OPT_DD): reason = "drawdown"
         else:
-            try: exp_dt = datetime.fromisoformat(p["expiry"])
-            except Exception: exp_dt = datetime.strptime(p["expiry"], "%Y-%m-%d")
+            try:
+                exp_dt = datetime.fromisoformat(p["expiry"])
+            except Exception:
+                exp_dt = datetime.strptime(p["expiry"], "%Y-%m-%d")
             if (exp_dt.date() - datetime.now(UTC).date()).days <= S.DTE_STOP:
                 reason = "time"
 
@@ -419,7 +386,7 @@ def process_candidate_tradier(t: str, cnt: Dict[str,int]):
 
     exps = tradier_expirations(t)
     if not exps:
-        if DEBUG: print(f"[SKIP] {t}: no expirations (unexpected after optionable=True)")
+        if DEBUG: print(f"[SKIP] {t}: no expirations")
         return
 
     today = datetime.now(UTC)
@@ -441,9 +408,29 @@ def process_candidate_tradier(t: str, cnt: Dict[str,int]):
             spot, best.mid, spot, chandelier(spot, atr_val), best.mid, datetime.now(UTC).isoformat()))
     cnt["buys"] += 1
 
+# -------------------- Alpaca screening --------------------
+def screen_symbol_via_alpaca(sym: str) -> bool:
+    df = alpaca_history_daily_symbol(sym, 420)
+    if df.empty:
+        if DEBUG: print(f"[SKIP] {sym}: no bars")
+        return False
+    last_close = float(df["Close"].iloc[-1])
+    if last_close < S.MIN_PRICE:
+        if DEBUG: print(f"[SKIP] {sym}: last close {last_close:.2f} < ${S.MIN_PRICE:.2f}")
+        return False
+    passed = trend_ok(df)
+    if DEBUG:
+        if passed:
+            r = rsi(df["Close"], S.RSI_LEN).iloc[-1]
+            ef = ema(df["Close"], S.EMA_FAST).iloc[-1]
+            es = ema(df["Close"], S.EMA_SLOW).iloc[-1]
+            print(f"[PASS] {sym}: Close={last_close:.2f}, EMA20={ef:.2f}>EMA50={es:.2f}, RSI={r:.1f}")
+        else:
+            print(f"[FAIL] {sym}: trend not confirmed (Close={last_close:.2f})")
+    return passed
+
 # -------------------- Runner --------------------
 def run_once():
-    # Check env
     miss=[]
     if not S.ALPACA_KEY or not S.ALPACA_SECRET: miss.append("APCA_API_KEY_ID/APCA_API_SECRET_KEY")
     if not S.TRADIER_TOKEN: miss.append("TRADIER_TOKEN")
@@ -453,57 +440,24 @@ def run_once():
 
     db_init()
 
-    # 1) Universe from Alpaca
-    syms = alpaca_universe_all()
-    print(f"[INFO] Alpaca universe loaded: {len(syms)} symbols")
+    # 1) Universe: Alpaca assets → filter to NYSE/NASDAQ (or ALLOWED_EXCHANGES)
+    syms = alpaca_universe_filtered()
+    print(f"[INFO] Universe after exchange filter: {len(syms)} symbols")
 
-    # 2) Ensure optionable cache; only screen optionable=True
+    # 2) Screen each symbol via Alpaca (EMA/RSI) with $5 price floor
     candidates: List[str] = []
-    checks_used = 0
-    budget = S.OPTIONABLE_CHECK_BUDGET  # 0 = unlimited
-
     for i, sym in enumerate(syms, 1):
         try:
-            opt = optionable_get_cached(sym)
-            if opt is None:
-                if budget and checks_used >= budget:
-                    # stop discovering new ones this run
-                    if DEBUG and (i % 200 == 0):
-                        print(f"[INFO] Discovery budget reached at {i}/{len(syms)}")
-                    continue
-                # check Tradier one time (throttled)
-                is_opt = tradier_is_optionable(sym)
-                optionable_set(sym, is_opt)
-                checks_used += 1
-                if DEBUG and checks_used % 50 == 0:
-                    print(f"[DISCOVERY] checked={checks_used} so far…")
-                opt = is_opt
-
-            if not opt:
-                if DEBUG: print(f"[SKIP] {sym}: not optionable")
-                continue
-
-            # Optionable → pull bars & screen
-            df = alpaca_history_daily_symbol(sym, 420)
-            if df.empty:
-                if DEBUG: print(f"[SKIP] {sym}: no bars")
-                continue
-            if trend_ok(df):
-                if DEBUG:
-                    r = rsi(df["Close"], S.RSI_LEN).iloc[-1]
-                    ef = ema(df["Close"], S.EMA_FAST).iloc[-1]
-                    es = ema(df["Close"], S.EMA_SLOW).iloc[-1]
-                    print(f"[PASS] {sym}: EMA20={ef:.2f}>EMA50={es:.2f}, RSI={r:.1f}")
+            if DEBUG and i % 50 == 1:
+                print(f"[PROGRESS] Screening {i}/{len(syms)}…")
+            if screen_symbol_via_alpaca(sym):
                 candidates.append(sym)
-            else:
-                if DEBUG: print(f"[FAIL] {sym}: trend not confirmed")
-
         except Exception as e:
             print(f"[ERR][screen] {sym}: {e}")
 
-    print(f"[INFO] Candidates after screen: {len(candidates)} (new optionable checks used: {checks_used})")
+    print(f"[INFO] Candidates after screen: {len(candidates)}")
 
-    # 3) Options via Tradier for candidates
+    # 3) Options work via Tradier ONLY for candidates (throttled)
     cnt={"viable":0,"buys":0,"sells":0}
     for t in candidates:
         try:
@@ -511,7 +465,7 @@ def run_once():
         except Exception as e:
             print(f"[ERR] {t}: {e}")
 
-    # 4) Manage existing picks
+    # 4) Manage existing picks regardless of today's screen
     open_ticks = sorted(set([p["ticker"] for p in db_all()]))
     for t in open_ticks:
         try:
