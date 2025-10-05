@@ -1,20 +1,19 @@
 # =========================================
-# OptionExecutor (Tradier) - Railway Ready
-# - Scans underlyings, selects high-delta call, places orders via Tradier
-# - Advisor logic: daily trend OK, 30–60 DTE, delta 0.6–0.8, liquid, tight spread
-# - Risk mgmt (no fixed TP): ATR(14) chandelier trail (underlying),
-#   option peak drawdown stop, time stop (≤ DTE_STOP days)
-# - State: SQLite (per-contract trailing/peak) + broker positions for holdings
+# OptionExecutor (Tradier-only) – S&P 500 Scraper
+# - Universe: live scrape S&P 500 symbols from Wikipedia
+# - Rotation: MAX_TICKERS_PER_RUN + UNIVERSE_OFFSET
+# - Data & Orders: Tradier only (history, chains+greeks, quotes, positions, orders)
+# - Entries: daily trend OK; pick 30–60 DTE call, Δ 0.6–0.8, liquid, tight spread
+# - Exits: Chandelier ATR trail (underlying), option peak drawdown, time stop
+# - Logs: small summary per run
 # =========================================
 
 import os
-import math
-import time
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, UTC
+from typing import Dict, List, Optional
 
 import requests
 import pandas as pd
@@ -40,19 +39,15 @@ def _get_int(name, default):
     except Exception:
         return default
 
-def _get_csv(name, default_list):
-    v = os.getenv(name)
-    if not v: return list(default_list)
-    return [x.strip().upper() for x in v.split(",") if x.strip()]
-
 class SETTINGS:
-    # Universe
-    TICKERS = _get_csv("TICKERS", ["SPY","QQQ","AAPL","MSFT","NVDA","META","AMZN"])
+    # Universe control
+    MAX_TICKERS_PER_RUN = _get_int("MAX_TICKERS_PER_RUN", 75)   # how many to scan each run
+    UNIVERSE_OFFSET     = _get_int("UNIVERSE_OFFSET", 0)        # rotate with cron
 
     # Tradier API
     TRADIER_TOKEN   = os.getenv("TRADIER_TOKEN", "")
-    TRADIER_BASE    = os.getenv("TRADIER_BASE", "https://sandbox.tradier.com")  # paper: sandbox; live: https://api.tradier.com
-    TRADIER_ACCOUNT = os.getenv("TRADIER_ACCOUNT", "")  # your account id (sandbox/live)
+    TRADIER_BASE    = os.getenv("TRADIER_BASE", "https://sandbox.tradier.com")  # sandbox | https://api.tradier.com
+    TRADIER_ACCOUNT = os.getenv("TRADIER_ACCOUNT", "")  # required if DRY_RUN=false
 
     # Selection filters
     DTE_MIN = _get_int("DTE_MIN", 30)
@@ -79,7 +74,7 @@ class SETTINGS:
 
     # Execution
     DRY_RUN  = _get_bool("DRY_RUN", True)            # true = simulate orders
-    DURATION = os.getenv("ORDER_DURATION", "day")    # day or gtc
+    DURATION = os.getenv("ORDER_DURATION", "day")    # day | gtc
 
     # Persistence
     DB_PATH = os.getenv("DB_PATH", "./executor_tradier.db")
@@ -93,7 +88,7 @@ def _auth_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {SETTINGS.TRADIER_TOKEN}",
         "Accept": "application/json",
-        "User-Agent": "OptionExecutor/1.0"
+        "User-Agent": "OptionExecutor/1.3"
     }
 
 def tget(path: str, params: Dict = None) -> Dict:
@@ -113,7 +108,6 @@ def tpost(path: str, data: Dict) -> Dict:
         data=data,
         timeout=25
     )
-    # Tradier returns 200 OK even on order rejects with error payloads; still raise for connectivity issues
     try:
         return r.json()
     except Exception:
@@ -133,7 +127,7 @@ def tradier_quote(symbols: List[str]) -> Dict[str, Dict]:
     return quotes
 
 def tradier_history_daily(symbol: str, days: int = 420) -> pd.DataFrame:
-    start = (datetime.utcnow() - timedelta(days=days+10)).date().isoformat()
+    start = (datetime.now(UTC) - timedelta(days=days+10)).date().isoformat()
     data = tget("/v1/markets/history", {"symbol": symbol, "interval": "daily", "start": start})
     hist = (data.get("history") or {}).get("day")
     if not hist: return pd.DataFrame()
@@ -141,8 +135,8 @@ def tradier_history_daily(symbol: str, days: int = 420) -> pd.DataFrame:
     for col in ("open","high","low","close","volume"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["date"] = pd.to_datetime(df["date"])
-    df = df.rename(columns={"open":"High_open_ignore","high":"High","low":"Low","close":"Close","volume":"Volume"})
-    # The "open" key name conflict workaround above avoids accidental use; only High/Low/Close/Volume used here
+    # Use only High/Low/Close/Volume
+    df = df.rename(columns={"high":"High","low":"Low","close":"Close","volume":"Volume"})
     df = df.set_index("date").sort_index()
     return df
 
@@ -169,9 +163,6 @@ def tradier_chain(symbol: str, expiration: str) -> pd.DataFrame:
 
 # ---- Accounts / Positions / Orders ----
 def tradier_positions() -> List[Dict]:
-    """
-    Returns list of positions (including options) for the account.
-    """
     if not SETTINGS.TRADIER_ACCOUNT:
         return []
     data = tget(f"/v1/accounts/{SETTINGS.TRADIER_ACCOUNT}/positions")
@@ -180,20 +171,14 @@ def tradier_positions() -> List[Dict]:
     return pos if isinstance(pos, list) else [pos]
 
 def tradier_place_option_order(symbol_occ: str, side: str, qty: int, order_type: str = "limit", price: Optional[float] = None, duration: Optional[str] = None) -> Dict:
-    """
-    Place an options order. side ∈ {"buy_to_open","sell_to_close"}
-    order_type ∈ {"market","limit"}; duration like "day" or "gtc".
-    """
     if SETTINGS.DRY_RUN:
         return {"status": "dry_run", "symbol": symbol_occ, "side": side, "qty": qty, "type": order_type, "price": price, "duration": duration or SETTINGS.DURATION}
-
     if not SETTINGS.TRADIER_ACCOUNT:
         return {"error": "TRADIER_ACCOUNT not set"}
-
     payload = {
         "class": "option",
         "symbol": symbol_occ,
-        "side": side,
+        "side": side,  # buy_to_open / sell_to_close
         "quantity": str(int(max(1, qty))),
         "type": order_type,
         "duration": duration or SETTINGS.DURATION,
@@ -202,7 +187,6 @@ def tradier_place_option_order(symbol_occ: str, side: str, qty: int, order_type:
         if price is None:
             return {"error": "limit order requires price"}
         payload["price"] = f"{price:.02f}"
-
     return tpost(f"/v1/accounts/{SETTINGS.TRADIER_ACCOUNT}/orders", payload)
 
 
@@ -297,6 +281,35 @@ def db_update_pick(contract: str, highest_close: float, trail: float, peak_optio
     con.close()
 
 
+# -------------------- Universe (Wikipedia scrape) --------------------
+def get_universe_symbols() -> List[str]:
+    """
+    Scrape the official S&P 500 component list from Wikipedia.
+    Replaces '.' with '-' for OCC/Tradier compatibility (e.g., BRK.B -> BRK-B).
+    """
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        tables = pd.read_html(url)  # requires lxml
+        df = tables[0]  # first table has the components
+        symbols = (
+            df["Symbol"]
+            .astype(str)
+            .str.replace(".", "-", regex=False)
+            .str.upper()
+            .tolist()
+        )
+        # Deduplicate while preserving order
+        seen = set(); out = []
+        for s in symbols:
+            if s not in seen:
+                out.append(s); seen.add(s)
+        return out
+    except Exception as e:
+        print(f"[WARN] Could not scrape S&P 500 list: {e}")
+        # minimal fallback to avoid crashing the run
+        return ["AAPL","MSFT","NVDA","AMZN","META"]
+
+
 # -------------------- Selection / Execution --------------------
 @dataclass
 class OptionCandidate:
@@ -310,30 +323,36 @@ class OptionCandidate:
     delta: float
     dte: int
 
-def pick_best_call_from_chain(ticker: str, spot: float, expiration: str, today_utc: datetime) -> Optional[OptionCandidate]:
+def pick_best_call_from_chain(ticker: str, expiration: str, today_dt: datetime) -> Optional[OptionCandidate]:
     df = tradier_chain(ticker, expiration)
-    if df is None or df.empty: return None
+    if df is None or df.empty:
+        return None
     calls = df[df.get("option_type") == "call"].copy()
-    if calls.empty: return None
+    if calls.empty:
+        return None
 
-    # compute DTE
+    # Some expiries may lack delta (esp. sandbox/illiquid)
+    if "delta" not in calls.columns:
+        if SETTINGS.VERBOSE:
+            print(f"[INFO] skip {ticker} {expiration}: no delta in chain")
+        return None
+
+    # DTE window
     try:
         exp_dt = datetime.fromisoformat(expiration)
     except Exception:
         exp_dt = datetime.strptime(expiration, "%Y-%m-%d")
-    dte = max(0, (exp_dt.date() - today_utc.date()).days)
+    dte = max(0, (exp_dt.date() - today_dt.date()).days)
     if dte < SETTINGS.DTE_MIN or dte > SETTINGS.DTE_MAX:
         return None
 
-    # clean numeric
+    # numeric + liquidity
     for c in ["bid","ask","volume","open_interest","delta","strike"]:
         if c in calls.columns:
             calls[c] = pd.to_numeric(calls[c], errors="coerce")
     calls["mid"] = (calls["bid"] + calls["ask"]) / 2.0
     calls = calls[(calls["bid"] > 0) & (calls["ask"] > 0) & (calls["ask"] >= calls["bid"])]
     calls["spread_pct"] = (calls["ask"] - calls["bid"]) / calls["mid"].clip(lower=1e-9)
-
-    # liquidity / spread / delta
     calls = calls[
         (calls["open_interest"] >= SETTINGS.OI_MIN) &
         (calls["volume"] >= SETTINGS.VOL_MIN) &
@@ -341,7 +360,8 @@ def pick_best_call_from_chain(ticker: str, spot: float, expiration: str, today_u
         (calls["delta"] >= SETTINGS.DELTA_MIN) &
         (calls["delta"] <= SETTINGS.DELTA_MAX)
     ]
-    if calls.empty: return None
+    if calls.empty:
+        return None
 
     target = 0.5 * (SETTINGS.DELTA_MIN + SETTINGS.DELTA_MAX)
     calls["delta_rank"] = (calls["delta"] - target).abs()
@@ -363,15 +383,13 @@ def pick_best_call_from_chain(ticker: str, spot: float, expiration: str, today_u
 def already_holding_contract(positions: List[Dict], occ_symbol: str) -> bool:
     for p in positions:
         sym = str(p.get("symbol") or "")
-        if sym == occ_symbol:
-            qty = float(p.get("quantity") or 0)
-            if qty > 0:
-                return True
+        if sym == occ_symbol and float(p.get("quantity") or 0) > 0:
+            return True
     return False
 
 
 # -------------------- Management (exits) --------------------
-def manage_open_picks_for_ticker(ticker: str, spot_now: float, atr_val: float, positions: List[Dict]):
+def manage_open_picks_for_ticker(ticker: str, spot_now: float, atr_val: float, positions: List[Dict], counters: Dict[str, int]):
     picks = [p for p in db_get_picks() if p["ticker"] == ticker]
     if not picks: return
 
@@ -399,90 +417,88 @@ def manage_open_picks_for_ticker(ticker: str, spot_now: float, atr_val: float, p
                 exp_dt = datetime.fromisoformat(p["expiry"])
             except Exception:
                 exp_dt = datetime.strptime(p["expiry"], "%Y-%m-%d")
-            dte = max(0, (exp_dt.date() - datetime.utcnow().date()).days)
+            dte = max(0, (exp_dt.date() - datetime.now(UTC).date()).days)
             if dte <= SETTINGS.DTE_STOP:
                 reason = "time_stop"
 
         if reason:
-            # Place SELL if we actually hold the contract
             if already_holding_contract(positions, p["contract"]):
                 order = tradier_place_option_order(
                     symbol_occ=p["contract"],
                     side="sell_to_close",
                     qty=SETTINGS.ORDER_QTY,
-                    order_type="market",  # market out for certainty; you can switch to limit=bid
+                    order_type="market",
                     price=None
                 )
                 print(f"SELL {ticker} | {p['contract']} | reason={reason} | mid≈{mid_now:.2f} | resp={json.dumps(order)}")
+                counters["sells"] += 1
             else:
                 print(f"SELL SIGNAL (no position) {ticker} | {p['contract']} | reason={reason} | mid≈{mid_now:.2f}")
-
             db_delete_pick(p["contract"])
         else:
             db_update_pick(p["contract"], new_high, new_trail, new_peak)
 
 
-# -------------------- Core flow --------------------
-def process_ticker(ticker: str, positions: List[Dict]):
+# -------------------- Core per-ticker flow --------------------
+def process_ticker(ticker: str, positions: List[Dict], counters: Dict[str, int]):
     # 1) daily history
     hist = tradier_history_daily(ticker, days=420)
+    counters["scanned"] += 1
     if hist is None or hist.empty:
-        if SETTINGS.VERBOSE: print(f"[WARN] no daily for {ticker}")
         return
+    # trend confirm
     if not daily_trend_ok(hist):
         return
+    counters["trend_pass"] += 1
+
     spot_now = float(hist["Close"].iloc[-1])
     atr_val = float(atr(hist, SETTINGS.ATR_LEN).iloc[-1])
 
     # 2) expirations
     exps = tradier_expirations(ticker)
-    if not exps: return
+    if not exps:
+        return
 
-    # 3) pick best call
-    today_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+    # 3) choose first good call
+    today_utc = datetime.now(UTC)
     best_pick = None
+    viable_chain = False
     for exp in exps:
+        # quick DTE check before fetching
         try:
-            # quick window check
-            try:
-                exp_dt = datetime.fromisoformat(exp)
-            except Exception:
-                exp_dt = datetime.strptime(exp, "%Y-%m-%d")
-            dte = max(0, (exp_dt.date() - today_utc.date()).days)
-            if dte < SETTINGS.DTE_MIN or dte > SETTINGS.DTE_MAX:
-                continue
+            exp_dt = datetime.fromisoformat(exp)
+        except Exception:
+            exp_dt = datetime.strptime(exp, "%Y-%m-%d")
+        dte = max(0, (exp_dt.date() - today_utc.date()).days)
+        if dte < SETTINGS.DTE_MIN or dte > SETTINGS.DTE_MAX:
+            continue
 
-            cand = pick_best_call_from_chain(ticker, spot_now, exp, today_utc)
-            if cand:
-                best_pick = cand
-                break
-        except Exception as e:
-            if SETTINGS.VERBOSE: print(f"[WARN] chain {ticker} {exp}: {e}")
+        cand = pick_best_call_from_chain(ticker, exp, today_utc)
+        if cand:
+            viable_chain = True
+            best_pick = cand
+            break
+    if viable_chain:
+        counters["viable_options"] += 1
 
-    # 4) BUY if candidate found and not already held or in picks
+    # 4) BUY if candidate & not already held/tracked
     if best_pick:
         in_db = any(p["contract"] == best_pick.contract for p in db_get_picks())
         have_pos = already_holding_contract(positions, best_pick.contract)
-
         if not have_pos and not in_db:
-            # entry price hint: limit at min(ask, mid*1.02)
             limit_price = round(min(best_pick.ask, best_pick.mid * 1.02), 2)
+            order = tradier_place_option_order(
+                symbol_occ=best_pick.contract,
+                side="buy_to_open",
+                qty=SETTINGS.ORDER_QTY,
+                order_type="limit",
+                price=limit_price,
+                duration=SETTINGS.DURATION
+            )
+            print(f"BUY {ticker} | {best_pick.contract} | Δ≈{best_pick.delta:.2f} | "
+                  f"limit≤{limit_price:.2f} | resp={json.dumps(order)}")
+            counters["buys"] += 1
 
-            if SETTINGS.ORDER_QTY <= 0:
-                print(f"BUY SIGNAL (config ORDER_QTY<=0): {ticker} | {best_pick.contract} | mid≈{best_pick.mid:.2f}")
-            else:
-                order = tradier_place_option_order(
-                    symbol_occ=best_pick.contract,
-                    side="buy_to_open",
-                    qty=SETTINGS.ORDER_QTY,
-                    order_type="limit",
-                    price=limit_price,
-                    duration=SETTINGS.DURATION
-                )
-                print(f"BUY {ticker} | {best_pick.contract} | Δ≈{best_pick.delta:.2f} | "
-                      f"limit≤{limit_price:.2f} | resp={json.dumps(order)}")
-
-            # track in DB regardless of immediate fill status (we manage via exits)
             highest_close = spot_now
             trail = chandelier_trail(highest_close, atr_val)
             db_insert_pick({
@@ -496,13 +512,14 @@ def process_ticker(ticker: str, positions: List[Dict]):
                 "highest_close": highest_close,
                 "trail": trail,
                 "peak_option": best_pick.mid,
-                "created_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+                "created_at": datetime.now(UTC).isoformat()
             })
 
-    # 5) Manage exits for this ticker
-    manage_open_picks_for_ticker(ticker, spot_now, atr_val, positions)
+    # 5) Manage exits
+    manage_open_picks_for_ticker(ticker, spot_now, atr_val, positions, counters)
 
 
+# -------------------- Runner --------------------
 def run_once():
     # validate env
     missing = []
@@ -513,20 +530,47 @@ def run_once():
         return
 
     db_init()
-    # pull positions once for this run
+
+    # Build universe (from Wikipedia)
+    universe = get_universe_symbols()
+    total_universe = len(universe)
+
+    # Rotation window
+    if SETTINGS.MAX_TICKERS_PER_RUN > 0:
+        start = (SETTINGS.UNIVERSE_OFFSET % max(1, total_universe))
+        end = min(start + SETTINGS.MAX_TICKERS_PER_RUN, total_universe)
+        batch = universe[start:end]
+    else:
+        batch = universe
+
+    counters = {
+        "scanned": 0,
+        "trend_pass": 0,
+        "viable_options": 0,
+        "buys": 0,
+        "sells": 0,
+        "universe": total_universe,
+        "batch": len(batch),
+        "offset": SETTINGS.UNIVERSE_OFFSET
+    }
+
     positions = tradier_positions() if not SETTINGS.DRY_RUN else []
-    for t in SETTINGS.TICKERS:
+
+    for t in batch:
         try:
-            process_ticker(t, positions)
+            process_ticker(t, positions, counters)
         except Exception as e:
             if SETTINGS.VERBOSE:
-                print(f"[ERR] process {t}: {e}")
+                print(f"[ERR] {t}: {e}")
 
+    # Small summary log
+    print(f"[SUMMARY] universe={counters['universe']} batch={counters['batch']} "
+          f"offset={counters['offset']} scanned={counters['scanned']} "
+          f"trend_pass={counters['trend_pass']} viable_options={counters['viable_options']} "
+          f"buys={counters['buys']} sells={counters['sells']}")
 
 if __name__ == "__main__":
-    # Runs once (best with Railway Cron: e.g., every 15m)
     run_once()
-    # For perpetual mode (optional):
-    # while True:
-    #     run_once()
-    #     time.sleep(900)
+    # For perpetual mode, uncomment:
+    # import time; 
+    # while True: run_once(); time.sleep(900)
