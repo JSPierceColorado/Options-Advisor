@@ -1,7 +1,7 @@
 # ==========================================================
-# OptionExecutor v1.9 — All Alpaca Symbols (simple) + Tradier Options
-# - No batching; per-symbol Alpaca bars (slower but very reliable)
-# - Full universe from Alpaca /v2/assets (active us_equity)
+# OptionExecutor v1.9.1 — All Alpaca Symbols (simple) + Tradier Options
+# - Per-symbol Alpaca bars (reliable)
+# - FIX: Flatten Tradier 'greeks' into top-level columns (delta, etc.)
 # - Options & orders via Tradier (1 req/sec throttle)
 # ==========================================================
 
@@ -33,17 +33,16 @@ class S:
     # --- Alpaca (market data only) ---
     ALPACA_KEY       = os.getenv("APCA_API_KEY_ID", "")
     ALPACA_SECRET    = os.getenv("APCA_API_SECRET_KEY", "")
-    # Use correct hosts for each API family:
-    ALPACA_DATA_BASE = os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.markets")  # stocks bars live here
-    ALPACA_TRADE_API = os.getenv("ALPACA_TRADE_API", "https://api.alpaca.markets")   # /v2/assets lives here
-    ALPACA_API_DELAY = _f("ALPACA_API_DELAY", 0.25)  # per request delay; 0.25s = ~240/hr
+    ALPACA_DATA_BASE = os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.markets")
+    ALPACA_TRADE_API = os.getenv("ALPACA_TRADE_API", "https://api.alpaca.markets")
+    ALPACA_API_DELAY = _f("ALPACA_API_DELAY", 0.25)
     ALPACA_FEED      = os.getenv("ALPACA_FEED", "iex")  # 'iex' (free) or 'sip' (paid)
 
     # --- Tradier (orders + options data) ---
     TRADIER_TOKEN     = os.getenv("TRADIER_TOKEN", "")
     TRADIER_BASE      = os.getenv("TRADIER_BASE", "https://sandbox.tradier.com")
     TRADIER_ACCOUNT   = os.getenv("TRADIER_ACCOUNT", "")
-    TRADIER_API_DELAY = _f("TRADIER_API_DELAY", 1.00)  # 1 req/sec
+    TRADIER_API_DELAY = _f("TRADIER_API_DELAY", 1.00)
     DRY_RUN   = _b("DRY_RUN", False)
     DURATION  = os.getenv("ORDER_DURATION", "day")
 
@@ -184,7 +183,6 @@ def alpaca_universe_all() -> List[str]:
         tradable = a.get("tradable", True)
         if sym and tradable:
             syms.append(sym.upper())
-    # dedup preserve order
     seen=set(); out=[]
     for s in syms:
         if s not in seen:
@@ -201,9 +199,8 @@ def alpaca_history_daily_symbol(symbol: str, days: int = 420) -> pd.DataFrame:
         "start": start,
         "limit": 1500,
         "adjustment": "raw",
-        "feed": S.ALPACA_FEED,  # 'iex' by default
+        "feed": S.ALPACA_FEED,
     }
-    # PER-SYMBOL bars endpoint:
     path = f"/v2/stocks/{symbol}/bars"
     d = _alpaca_get(S.ALPACA_DATA_BASE, path, params=params)
     bars = d.get("bars")
@@ -212,7 +209,6 @@ def alpaca_history_daily_symbol(symbol: str, days: int = 420) -> pd.DataFrame:
     df = pd.DataFrame(bars)
     if df.empty:
         return pd.DataFrame()
-    # expected columns: t, o, h, l, c, v, etc.
     df["date"] = pd.to_datetime(df["t"])
     df = df.rename(columns={"h":"High","l":"Low","c":"Close","v":"Volume"})
     for c in ("High","Low","Close","Volume"):
@@ -236,13 +232,33 @@ def tradier_expirations(sym: str) -> List[str]:
     return e if isinstance(e, list) else ([e] if e else [])
 
 def tradier_chain(sym: str, exp: str) -> pd.DataFrame:
+    """
+    Get chain with greeks and FLATTEN the greeks dict into top-level columns:
+    - delta, gamma, theta, vega, rho, mid_iv (if present), etc.
+    """
     d = _tradier_get("/v1/markets/options/chains", {"symbol": sym, "expiration": exp, "greeks": "true"})
     o = (d.get("options") or {}).get("option")
-    if not o: return pd.DataFrame()
+    if not o: 
+        return pd.DataFrame()
     df = pd.DataFrame(o)
-    for c in ["strike","bid","ask","volume","open_interest","delta"]:
+
+    # normalize numeric columns that might be top-level
+    for c in ["strike","bid","ask","volume","open_interest","last","change"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # FLATTEN GREEKS: df['greeks'] is a dict per row
+    if "greeks" in df.columns:
+        g = df["greeks"].apply(lambda x: x if isinstance(x, dict) else {})
+        df["delta"] = g.apply(lambda x: x.get("delta"))
+        df["gamma"] = g.apply(lambda x: x.get("gamma"))
+        df["theta"] = g.apply(lambda x: x.get("theta"))
+        df["vega"]  = g.apply(lambda x: x.get("vega"))
+        # IV fields sometimes named 'mid_iv', 'bid_iv', 'ask_iv'
+        df["iv"]    = g.apply(lambda x: x.get("mid_iv") if "mid_iv" in x else x.get("bid_iv") if "bid_iv" in x else x.get("ask_iv"))
+        for c in ["delta","gamma","theta","vega","iv"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     return df
 
 def tradier_quote(sym_occ: str) -> Dict:
@@ -272,35 +288,52 @@ class Pick:
 
 def pick_call_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
     df = tradier_chain(t, exp)
-    if df.empty or "delta" not in df:
-        if DEBUG: print(f"[INFO] {t} {exp}: empty chain or no delta")
+    if df.empty:
+        if DEBUG: print(f"[INFO] {t} {exp}: empty chain")
         return None
+
+    # Some payloads use 'type' instead of 'option_type' — normalize
+    if "option_type" not in df.columns and "type" in df.columns:
+        df["option_type"] = df["type"]
+
     calls = df[df.get("option_type") == "call"].copy()
-    if calls.empty: return None
+    if calls.empty:
+        return None
+
+    # DTE filter
     try:
         exp_dt = datetime.fromisoformat(exp)
     except Exception:
         exp_dt = datetime.strptime(exp, "%Y-%m-%d")
     dte = max(0, (exp_dt.date() - today.date()).days)
-    if not (S.DTE_MIN <= dte <= S.DTE_MAX): return None
+    if not (S.DTE_MIN <= dte <= S.DTE_MAX):
+        return None
+
+    # Ensure numeric + mid + spread
     for c in ["bid","ask","volume","open_interest","delta","strike"]:
         if c in calls.columns:
             calls[c] = pd.to_numeric(calls[c], errors="coerce")
-    calls["mid"] = (calls["bid"] + calls["ask"]) / 2.0
     calls = calls[(calls["bid"] > 0) & (calls["ask"] > 0) & (calls["ask"] >= calls["bid"])]
+    if calls.empty:
+        return None
+    calls["mid"] = (calls["bid"] + calls["ask"]) / 2.0
     calls["spr"] = (calls["ask"] - calls["bid"]) / calls["mid"].clip(1e-9)
+
+    # Liquidity + spread + DELTA band (now flattened)
     calls = calls[
         (calls["open_interest"] >= S.OI_MIN) &
         (calls["volume"] >= S.VOL_MIN) &
         (calls["spr"] <= S.MAX_SPREAD) &
-        (calls["delta"].between(S.DELTA_MIN, S.DELTA_MAX))
+        (calls["delta"].between(S.DELTA_MIN, S.DELTA_MAX, inclusive="both"))
     ]
-    if calls.empty: return None
+    if calls.empty:
+        return None
+
     target = 0.5*(S.DELTA_MIN + S.DELTA_MAX)
     calls["drank"] = (calls["delta"] - target).abs()
     best = calls.sort_values(by=["drank","spr","mid"], ascending=[True,True,False]).iloc[0]
-    return Pick(t, str(best["symbol"]), exp, float(best["strike"]), float(best["bid"]), float(best["ask"]),
-                float(best["mid"]), float(best["delta"]), dte)
+    return Pick(t, str(best.get("symbol")), exp, float(best["strike"]), float(best["bid"]),
+                float(best["ask"]), float(best["mid"]), float(best["delta"]), dte)
 
 # -------------------- Exits / management --------------------
 def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
@@ -371,6 +404,23 @@ def process_candidate_tradier(t: str, cnt: Dict[str,int]):
             spot, best.mid, spot, chandelier(spot, atr_val), best.mid, datetime.now(UTC).isoformat()))
     cnt["buys"] += 1
 
+# -------------------- Alpaca screening --------------------
+def screen_symbol_via_alpaca(sym: str) -> bool:
+    df = alpaca_history_daily_symbol(sym, 420)
+    if df.empty:
+        if DEBUG: print(f"[SKIP] {sym}: no bars")
+        return False
+    passed = trend_ok(df)
+    if DEBUG:
+        if passed:
+            r = rsi(df["Close"], S.RSI_LEN).iloc[-1]
+            ef = ema(df["Close"], S.EMA_FAST).iloc[-1]
+            es = ema(df["Close"], S.EMA_SLOW).iloc[-1]
+            print(f"[PASS] {sym}: EMA20={ef:.2f}>EMA50={es:.2f}, RSI={r:.1f}")
+        else:
+            print(f"[FAIL] {sym}: trend not confirmed")
+    return passed
+
 # -------------------- Runner --------------------
 def run_once():
     miss=[]
@@ -386,26 +436,14 @@ def run_once():
     syms = alpaca_universe_all()
     print(f"[INFO] Alpaca universe loaded: {len(syms)} symbols")
 
-    # 2) Screen each symbol via Alpaca (EMA/RSI). No batching—slow but robust.
+    # 2) Screen each symbol via Alpaca (EMA/RSI). No batching—simple & robust.
     candidates: List[str] = []
     for i, sym in enumerate(syms, 1):
         try:
             if DEBUG and i % 50 == 1:
                 print(f"[PROGRESS] Screening {i}/{len(syms)}…")
-
-            df = alpaca_history_daily_symbol(sym, 420)
-            if df.empty:
-                if DEBUG: print(f"[SKIP] {sym}: no bars")
-                continue
-            if trend_ok(df):
-                if DEBUG:
-                    r = rsi(df["Close"], S.RSI_LEN).iloc[-1]
-                    ef = ema(df["Close"], S.EMA_FAST).iloc[-1]
-                    es = ema(df["Close"], S.EMA_SLOW).iloc[-1]
-                    print(f"[PASS] {sym}: EMA20={ef:.2f}>EMA50={es:.2f}, RSI={r:.1f}")
+            if screen_symbol_via_alpaca(sym):
                 candidates.append(sym)
-            else:
-                if DEBUG: print(f"[FAIL] {sym}: trend not confirmed")
         except Exception as e:
             print(f"[ERR][screen] {sym}: {e}")
 
