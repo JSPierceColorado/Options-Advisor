@@ -1,10 +1,12 @@
 # ==========================================================
-# OptionExecutor v1.9.3 — All Alpaca US equities (no price floor) + Tradier options
-# - Universe: ALL Alpaca active us_equity (no exchange/price filters)
-# - Screener: EMA20>EMA50 & RSI>50 rising (daily)
-# - Options: Tradier chains with greeks flattened; 1 req/sec throttle
-# - Buy/Sell logic unchanged (ATR chandelier trail, drawdown, time-based exit)
-# - Set DEBUG=true for verbose progress + reasons
+# OptionExecutor v2.2 — S&P 500 Screener (Alpaca) → Options (Tradier)
+# - Universe: S&P 500 only (scraped from Wikipedia with UA; small hardcoded fallback)
+# - Screener: EMA20 > EMA50 and RSI(14) > 50 and rising (daily bars via Alpaca)
+# - Options: Tradier chains (greeks flattened). Correct order fields:
+#       symbol=<UNDERLYING>, option_symbol=<OCC>
+# - Throttling: Alpaca delay & Tradier ~1 req/sec
+# - Startup: sanity checks (market clock, profile, balances, env echo)
+# - Logging: set DEBUG=true for verbose progress
 # ==========================================================
 
 import os, json, sqlite3, time, requests, pandas as pd
@@ -15,44 +17,39 @@ from typing import Dict, List, Optional
 # -------------------- Settings --------------------
 def _b(name, d):
     v = os.getenv(name)
-    return d if v is None else v.lower() in ("1", "true", "yes", "y", "on")
+    return d if v is None else v.lower() in ("1","true","yes","y","on")
 
 def _f(name, d):
     v = os.getenv(name)
-    try:
-        return float(v) if v else d
-    except Exception:
-        return d
+    try: return float(v) if v else d
+    except Exception: return d
 
 def _i(name, d):
     v = os.getenv(name)
-    try:
-        return int(v) if v else d
-    except Exception:
-        return d
+    try: return int(v) if v else d
+    except Exception: return d
 
 class S:
     # --- Alpaca (market data only) ---
     ALPACA_KEY       = os.getenv("APCA_API_KEY_ID", "")
     ALPACA_SECRET    = os.getenv("APCA_API_SECRET_KEY", "")
     ALPACA_DATA_BASE = os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.markets")  # stocks bars
-    ALPACA_TRADE_API = os.getenv("ALPACA_TRADE_API", "https://api.alpaca.markets")   # /v2/assets
-    ALPACA_API_DELAY = _f("ALPACA_API_DELAY", 0.25)
+    ALPACA_API_DELAY = _f("ALPACA_API_DELAY", 0.20)  # per request; tweak if you need more/less speed
     ALPACA_FEED      = os.getenv("ALPACA_FEED", "iex")  # 'iex' (free) or 'sip' (paid)
 
     # --- Tradier (orders + options data) ---
     TRADIER_TOKEN     = os.getenv("TRADIER_TOKEN", "")
-    TRADIER_BASE      = os.getenv("TRADIER_BASE", "https://sandbox.tradier.com")
+    TRADIER_BASE      = os.getenv("TRADIER_BASE", "https://sandbox.tradier.com")  # live: https://api.tradier.com
     TRADIER_ACCOUNT   = os.getenv("TRADIER_ACCOUNT", "")
-    TRADIER_API_DELAY = _f("TRADIER_API_DELAY", 1.00)  # 1 req/sec
-    DRY_RUN   = _b("DRY_RUN", False)
-    DURATION  = os.getenv("ORDER_DURATION", "day")
+    TRADIER_API_DELAY = _f("TRADIER_API_DELAY", 1.00)  # 1 req/sec recommended
+    DRY_RUN           = _b("DRY_RUN", False)
+    DURATION          = os.getenv("ORDER_DURATION", "day")  # day / gtc
 
-    # --- Option filters ---
-    DTE_MIN, DTE_MAX           = _i("DTE_MIN", 30), _i("DTE_MAX", 60)
-    DELTA_MIN, DELTA_MAX       = _f("DELTA_MIN", 0.60), _f("DELTA_MAX", 0.80)
-    OI_MIN, VOL_MIN            = _i("OI_MIN", 200), _i("VOL_MIN", 50)
-    MAX_SPREAD                 = _f("MAX_SPREAD_PCT", 0.15)
+    # --- Strategy filters (options) ---
+    DTE_MIN, DTE_MAX       = _i("DTE_MIN", 30), _i("DTE_MAX", 60)
+    DELTA_MIN, DELTA_MAX   = _f("DELTA_MIN", 0.60), _f("DELTA_MAX", 0.80)
+    OI_MIN, VOL_MIN        = _i("OI_MIN", 200), _i("VOL_MIN", 50)
+    MAX_SPREAD             = _f("MAX_SPREAD_PCT", 0.15)
 
     # --- Indicators ---
     EMA_FAST, EMA_SLOW, RSI_LEN = _i("EMA_FAST", 20), _i("EMA_SLOW", 50), _i("RSI_LEN", 14)
@@ -73,10 +70,11 @@ def _alpaca_headers():
         "APCA-API-KEY-ID": S.ALPACA_KEY,
         "APCA-API-SECRET-KEY": S.ALPACA_SECRET,
         "Accept": "application/json",
+        "User-Agent": "OptionExecutor/2.2 (+S&P500 screener)"
     }
 
-def _alpaca_get(base, path, params=None):
-    url = base.rstrip("/") + path
+def _alpaca_get(path, params=None):
+    url = S.ALPACA_DATA_BASE.rstrip("/") + path
     try:
         r = requests.get(url, headers=_alpaca_headers(), params=params or {}, timeout=30)
         r.raise_for_status()
@@ -88,7 +86,11 @@ def _alpaca_get(base, path, params=None):
     return data
 
 def _tradier_headers():
-    return {"Authorization": f"Bearer {S.TRADIER_TOKEN}", "Accept": "application/json"}
+    return {
+        "Authorization": f"Bearer {S.TRADIER_TOKEN}",
+        "Accept": "application/json",
+        "User-Agent": "OptionExecutor/2.2"
+    }
 
 def _tradier_get(path, params=None):
     url = S.TRADIER_BASE.rstrip("/") + path
@@ -167,31 +169,49 @@ def db_del(c):
     con.execute("DELETE FROM picks WHERE contract=?", (c,))
     con.commit(); con.close()
 
-# -------------------- Alpaca Universe + Per-symbol Bars --------------------
-def alpaca_universe_all() -> List[str]:
-    """
-    All active US equities from Alpaca /v2/assets. Requires API keys.
-    """
-    if not (S.ALPACA_KEY and S.ALPACA_SECRET):
-        print("[ERROR] Alpaca keys missing (APCA_API_KEY_ID/APCA_API_SECRET_KEY).")
-        return []
-    params = {"status": "active", "asset_class": "us_equity"}
-    data = _alpaca_get(S.ALPACA_TRADE_API, "/v2/assets", params=params)
-    if not isinstance(data, list):
-        return []
-    syms = []
-    for a in data:
-        sym = a.get("symbol")
-        tradable = a.get("tradable", True)
-        if sym and tradable:
-            syms.append(sym.upper())
-    # dedup preserve order
-    seen=set(); out=[]
-    for s in syms:
-        if s not in seen:
-            out.append(s); seen.add(s)
-    return out
+# -------------------- S&P 500 universe --------------------
+_FALLBACK_SP500 = [
+    # Tiny fallback subset in case scraping fails hard (still functional)
+    "AAPL","MSFT","AMZN","GOOGL","META","NVDA","BRK.B","JPM","JNJ","XOM",
+    "V","PG","MA","AVGO","HD","KO","PEP","PFE","ABBV","BAC"
+]
 
+def sp500_symbols() -> List[str]:
+    """
+    Scrape the S&P 500 ticker list (Wikipedia).
+    Uses a desktop User-Agent to reduce 403s.
+    Falls back to a small hardcoded set if it cannot fetch.
+    """
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    }
+    try:
+        html = requests.get(url, headers=headers, timeout=30).text
+        tables = pd.read_html(html)
+        # The first table usually contains the constituents
+        df = tables[0]
+        # Ticker column can be named differently; try common variants
+        for col in ["Symbol", "Ticker symbol", "Ticker"]:
+            if col in df.columns:
+                syms = [str(x).strip().upper().replace(" ", "") for x in df[col].tolist()]
+                # Wikipedia sometimes has "." vs "·" or notes; clean a bit
+                syms = [s.replace("\u200a", "").replace("\u00b7",".") for s in syms]
+                # Dedup while preserving order
+                seen=set(); out=[]
+                for s in syms:
+                    if s and s not in seen:
+                        out.append(s); seen.add(s)
+                if DEBUG:
+                    print(f"[INFO] S&P 500 scraped: {len(out)} symbols")
+                return out
+        print("[WARN] S&P 500: expected ticker column not found; using fallback")
+    except Exception as e:
+        print(f"[WARN] Could not scrape S&P 500 list: {e}; using fallback")
+    return _FALLBACK_SP500[:]
+
+# -------------------- Alpaca (per-symbol daily bars) --------------------
 def alpaca_history_daily_symbol(symbol: str, days: int = 420) -> pd.DataFrame:
     """
     Fetch 1Day bars for a single symbol via data.alpaca.markets.
@@ -205,13 +225,11 @@ def alpaca_history_daily_symbol(symbol: str, days: int = 420) -> pd.DataFrame:
         "feed": S.ALPACA_FEED,
     }
     path = f"/v2/stocks/{symbol}/bars"
-    d = _alpaca_get(S.ALPACA_DATA_BASE, path, params=params)
+    d = _alpaca_get(path, params=params)
     bars = d.get("bars")
-    if not bars:
-        return pd.DataFrame()
+    if not bars: return pd.DataFrame()
     df = pd.DataFrame(bars)
-    if df.empty:
-        return pd.DataFrame()
+    if df.empty: return pd.DataFrame()
     df["date"] = pd.to_datetime(df["t"])
     df = df.rename(columns={"h":"High","l":"Low","c":"Close","v":"Volume"})
     for c in ("High","Low","Close","Volume"):
@@ -241,7 +259,7 @@ def tradier_chain(sym: str, exp: str) -> pd.DataFrame:
     """
     d = _tradier_get("/v1/markets/options/chains", {"symbol": sym, "expiration": exp, "greeks": "true"})
     o = (d.get("options") or {}).get("option")
-    if not o:
+    if not o: 
         return pd.DataFrame()
     df = pd.DataFrame(o)
 
@@ -269,21 +287,64 @@ def tradier_quote(sym_occ: str) -> Dict:
     d = _tradier_get("/v1/markets/quotes", {"symbols": sym_occ})
     return (d.get("quotes") or {}).get("quote") or {}
 
-def tradier_positions() -> List[Dict]:
-    if not S.TRADIER_ACCOUNT: return []
-    d = _tradier_get(f"/v1/accounts/{S.TRADIER_ACCOUNT}/positions")
-    p = (d.get("positions") or {}).get("position")
-    return p if isinstance(p, list) else ([p] if p else [])
-
-def tradier_order(sym_occ: str, side: str, qty: int, otype="limit", price=None):
+def tradier_order(underlying: str, occ_symbol: str, side: str, qty: int, otype="limit", price=None, preview=False):
+    """
+    Places a single-leg OPTION order on Tradier.
+    - underlying: e.g., "AAPL"
+    - occ_symbol: e.g., "AAPL241220C00195000"
+    """
     if S.DRY_RUN:
-        return {"status":"dry_run","symbol":sym_occ,"side":side,"qty":qty,"type":otype,"price":price}
+        print("[DRY_RUN] order", {"underlying": underlying, "occ": occ_symbol, "side": side, "qty": qty, "type": otype, "price": price})
+        return {"status": "dry_run"}
+
     if not S.TRADIER_ACCOUNT:
-        return {"error":"no account"}
-    data={"class":"option","symbol":sym_occ,"side":side,"quantity":str(qty),"type":otype,"duration":S.DURATION}
-    if otype=="limit" and price is not None:
-        data["price"]=f"{price:.2f}"
-    return _tradier_post(f"/v1/accounts/{S.TRADIER_ACCOUNT}/orders", data)
+        print("[ERROR] TRADIER_ACCOUNT is missing.")
+        return {"error": "no account"}
+
+    data = {
+        "class": "option",
+        "symbol": underlying,          # <-- REQUIRED: underlying here
+        "option_symbol": occ_symbol,   # <-- REQUIRED: OCC symbol here
+        "side": side,                  # buy_to_open / sell_to_close
+        "quantity": str(qty),
+        "type": otype,                 # market / limit
+        "duration": S.DURATION,        # day / gtc
+    }
+    if otype == "limit" and price is not None:
+        data["price"] = f"{price:.2f}"
+    if preview:
+        data["preview"] = "true"
+
+    resp = _tradier_post(f"/v1/accounts/{S.TRADIER_ACCOUNT}/orders", data)
+
+    # Surface any errors right in the logs
+    if "errors" in resp:
+        print("[TRADIER][ORDER][ERROR]", json.dumps(resp, indent=2))
+    else:
+        print("[TRADIER][ORDER][OK]", json.dumps(resp, indent=2))
+    return resp
+
+# -------------------- Connectivity / sanity checks --------------------
+def sanity_check_tradier():
+    print(f"[ENV] TRADIER_BASE={S.TRADIER_BASE} token_set={bool(S.TRADIER_TOKEN)} account={S.TRADIER_ACCOUNT}")
+    try:
+        clock = _tradier_get("/v1/markets/clock")
+        print("[CHECK] market clock:", clock)
+    except Exception as e:
+        print("[CHECK] clock error:", e)
+    try:
+        profile = _tradier_get("/v1/user/profile")
+        print("[CHECK] user profile:", profile)
+    except Exception as e:
+        print("[CHECK] profile error:", e)
+    try:
+        if S.TRADIER_ACCOUNT:
+            bals = _tradier_get(f"/v1/accounts/{S.TRADIER_ACCOUNT}/balances")
+            print("[CHECK] balances:", bals)
+            ords = _tradier_get(f"/v1/accounts/{S.TRADIER_ACCOUNT}/orders")
+            print("[CHECK] existing orders:", ords)
+    except Exception as e:
+        print("[CHECK] account error:", e)
 
 # -------------------- Options selection --------------------
 @dataclass
@@ -302,14 +363,14 @@ def pick_call_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
     calls = df[df.get("option_type") == "call"].copy()
     if calls.empty: return None
 
-    try:
-        exp_dt = datetime.fromisoformat(exp)
-    except Exception:
-        exp_dt = datetime.strptime(exp, "%Y-%m-%d")
+    # DTE filter
+    try: exp_dt = datetime.fromisoformat(exp)
+    except Exception: exp_dt = datetime.strptime(exp, "%Y-%m-%d")
     dte = max(0, (exp_dt.date() - today.date()).days)
     if not (S.DTE_MIN <= dte <= S.DTE_MAX):
         return None
 
+    # Ensure numeric + mid + spread
     for c in ["bid","ask","volume","open_interest","delta","strike"]:
         if c in calls.columns:
             calls[c] = pd.to_numeric(calls[c], errors="coerce")
@@ -319,6 +380,7 @@ def pick_call_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
     calls["mid"] = (calls["bid"] + calls["ask"]) / 2.0
     calls["spr"] = (calls["ask"] - calls["bid"]) / calls["mid"].clip(1e-9)
 
+    # Liquidity + spread + DELTA band
     calls = calls[
         (calls["open_interest"] >= S.OI_MIN) &
         (calls["volume"] >= S.VOL_MIN) &
@@ -354,16 +416,14 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
         if spot < trail: reason = "trail"
         elif mid <= peak*(1 - S.OPT_DD): reason = "drawdown"
         else:
-            try:
-                exp_dt = datetime.fromisoformat(p["expiry"])
-            except Exception:
-                exp_dt = datetime.strptime(p["expiry"], "%Y-%m-%d")
+            try: exp_dt = datetime.fromisoformat(p["expiry"])
+            except Exception: exp_dt = datetime.strptime(p["expiry"], "%Y-%m-%d")
             if (exp_dt.date() - datetime.now(UTC).date()).days <= S.DTE_STOP:
                 reason = "time"
 
         if reason:
             print(f"SELL {t} {p['contract']} reason={reason}")
-            tradier_order(p["contract"], "sell_to_close", S.QTY, "market")
+            tradier_order(t, p["contract"], "sell_to_close", S.QTY, "market")
             db_del(p["contract"])
             cnt["sells"] += 1
         else:
@@ -371,6 +431,7 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
 
 # -------------------- Candidate processing --------------------
 def process_candidate_tradier(t: str, cnt: Dict[str,int]):
+    # Underlying hist via Tradier (for ATR trail at entry)
     hist = tradier_history_daily(t, 420)
     if hist.empty:
         if DEBUG: print(f"[SKIP] {t}: no Tradier history")
@@ -397,13 +458,13 @@ def process_candidate_tradier(t: str, cnt: Dict[str,int]):
 
     limit = round(min(best.ask, best.mid * 1.02), 2)
     print(f"BUY {t} {best.contract} Δ={best.delta:.2f} @{limit}")
-    tradier_order(best.contract, "buy_to_open", S.QTY, "limit", limit)
+    tradier_order(t, best.contract, "buy_to_open", S.QTY, "limit", limit)
     db_add((t, best.contract, best.expiry, best.strike, best.delta,
             spot, best.mid, spot, chandelier(spot, atr_val), best.mid, datetime.now(UTC).isoformat()))
     cnt["buys"] += 1
 
-# -------------------- Alpaca screening --------------------
-def screen_symbol_via_alpaca(sym: str) -> bool:
+# -------------------- Screening (S&P 500 only) --------------------
+def screen_symbol(sym: str) -> bool:
     df = alpaca_history_daily_symbol(sym, 420)
     if df.empty:
         if DEBUG: print(f"[SKIP] {sym}: no bars")
@@ -414,13 +475,14 @@ def screen_symbol_via_alpaca(sym: str) -> bool:
             r = rsi(df["Close"], S.RSI_LEN).iloc[-1]
             ef = ema(df["Close"], S.EMA_FAST).iloc[-1]
             es = ema(df["Close"], S.EMA_SLOW).iloc[-1]
-            print(f"[PASS] {sym}: EMA20={ef:.2f}>EMA50={es:.2f}, RSI={r:.1f}")
+            print(f"[PASS] {sym}: EMA{S.EMA_FAST}={ef:.2f}>EMA{S.EMA_SLOW}={es:.2f}, RSI={r:.1f}")
         else:
             print(f"[FAIL] {sym}: trend not confirmed")
     return passed
 
 # -------------------- Runner --------------------
 def run_once():
+    # Validate env
     miss=[]
     if not S.ALPACA_KEY or not S.ALPACA_SECRET: miss.append("APCA_API_KEY_ID/APCA_API_SECRET_KEY")
     if not S.TRADIER_TOKEN: miss.append("TRADIER_TOKEN")
@@ -428,26 +490,28 @@ def run_once():
     if miss:
         print("[ERROR] missing env:", ", ".join(miss)); return
 
+    print(f"[ENV] Alpaca feed={S.ALPACA_FEED} base={S.ALPACA_DATA_BASE}")
     db_init()
+    sanity_check_tradier()
 
-    # 1) Universe: Alpaca assets (ALL active US equities)
-    syms = alpaca_universe_all()
-    print(f"[INFO] Universe (Alpaca active us_equity): {len(syms)} symbols")
+    # 1) Universe: S&P 500 only
+    syms = sp500_symbols()
+    print(f"[INFO] Universe: S&P 500 symbols={len(syms)}")
 
-    # 2) Screen each symbol via Alpaca (EMA/RSI)
+    # 2) Screen each symbol (EMA/RSI) — much smaller & faster than full US
     candidates: List[str] = []
     for i, sym in enumerate(syms, 1):
         try:
             if DEBUG and i % 50 == 1:
                 print(f"[PROGRESS] Screening {i}/{len(syms)}…")
-            if screen_symbol_via_alpaca(sym):
+            if screen_symbol(sym):
                 candidates.append(sym)
         except Exception as e:
             print(f"[ERR][screen] {sym}: {e}")
 
     print(f"[INFO] Candidates after screen: {len(candidates)}")
 
-    # 3) Options work via Tradier ONLY for candidates (throttled)
+    # 3) Options via Tradier ONLY for candidates (throttled)
     cnt={"viable":0,"buys":0,"sells":0}
     for t in candidates:
         try:
@@ -455,7 +519,7 @@ def run_once():
         except Exception as e:
             print(f"[ERR] {t}: {e}")
 
-    # 4) Manage existing picks regardless of today's screen
+    # 4) Manage existing picks
     open_ticks = sorted(set([p["ticker"] for p in db_all()]))
     for t in open_ticks:
         try:
