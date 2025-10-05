@@ -1,5 +1,5 @@
 # ==========================================================
-# OptionExecutor v1.5 — Tradier Paper-Trading, Full Auto
+# OptionExecutor v1.6 — Tradier Paper-Trading, Full Auto + Debug
 # ==========================================================
 
 import os, json, sqlite3, time, requests, pandas as pd
@@ -48,6 +48,9 @@ class S:
     DB = os.getenv("DB_PATH", "./executor_tradier.db")
     API_DELAY = _f("API_DELAY", 1.0)
     VERBOSE = _b("VERBOSE", True)
+
+# Enable full debug logging
+DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
 
 # -------------------- HTTP wrappers --------------------
 def _hdr():
@@ -246,17 +249,37 @@ def manage_open(t, spot, atrv, cnt):
             db_upd(p["contract"], hi, trail, peak)
 
 def process(t, cnt):
+    if DEBUG:
+        print(f"\n[SCAN] {t} ...")
+
     df = hist(t, 420)
     cnt["scan"] += 1
-    if df.empty or not trend_ok(df):
+    if df.empty:
+        if DEBUG: print(f"[SKIP] {t}: no history data")
         return
+    if not trend_ok(df):
+        if DEBUG: print(f"[SKIP] {t}: trend not confirmed")
+        return
+
     cnt["trend"] += 1
     spot = float(df["Close"].iloc[-1])
     a = float(atr(df, S.ATR_LEN).iloc[-1])
+    r = rsi(df["Close"], S.RSI_LEN).iloc[-1]
+    if DEBUG:
+        print(f"[TREND OK] {t}: Close={spot:.2f}, RSI={r:.1f}, ATR={a:.2f}")
+
     today = datetime.now(UTC)
-    for e in expirations(t):
+    exps = expirations(t)
+    if DEBUG:
+        print(f"[INFO] {t} expirations: {len(exps)} found")
+
+    found = False
+    for e in exps:
         c = pick_call(t, e, today)
         if c:
+            found = True
+            if DEBUG:
+                print(f"[CANDIDATE] {t}: {c.contract}, Δ={c.delta:.2f}, strike={c.strike}, dte={c.dte}, bid={c.bid}, ask={c.ask}")
             cnt["viable"] += 1
             limit = round(min(c.ask, c.mid * 1.02), 2)
             print(f"BUY {t} {c.contract} Δ={c.delta:.2f} @{limit}")
@@ -265,6 +288,9 @@ def process(t, cnt):
                     c.mid, datetime.now(UTC).isoformat()))
             cnt["buys"] += 1
             break
+    if not found and DEBUG:
+        print(f"[NO OPTIONS] {t}: no suitable contracts found")
+
     manage_open(t, spot, a, cnt)
 
 # -------------------- Runner --------------------
