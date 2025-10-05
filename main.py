@@ -1,24 +1,26 @@
 # =========================================
-# OptionAdvisor Free (Yahoo/yfinance) - Railway Ready
-# - Advisor-only: prints BUY and SELL signals, no auto-trading
-# - Data source: yfinance (free). Chains + IV are scraped from Yahoo Finance.
-# - Entry (per underlying): daily trend OK + 30-60 DTE calls + delta 0.6-0.8 + liquidity
-# - Exits (no fixed TP): Chandelier ATR trailing stop (underlying) OR option peak drawdown
-# - State: SQLite (open picks: track trail/peaks)
+# OptionExecutor (Tradier) - Railway Ready
+# - Scans underlyings, selects high-delta call, places orders via Tradier
+# - Advisor logic: daily trend OK, 30–60 DTE, delta 0.6–0.8, liquid, tight spread
+# - Risk mgmt (no fixed TP): ATR(14) chandelier trail (underlying),
+#   option peak drawdown stop, time stop (≤ DTE_STOP days)
+# - State: SQLite (per-contract trailing/peak) + broker positions for holdings
 # =========================================
 
 import os
 import math
 import time
+import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import List, Optional, Tuple, Dict
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
 
+import requests
 import pandas as pd
-import yfinance as yf
 
-# ---------------- Settings ----------------
+
+# -------------------- Settings --------------------
 def _get_bool(name, default):
     v = os.getenv(name)
     if v is None: return default
@@ -44,55 +46,167 @@ def _get_csv(name, default_list):
     return [x.strip().upper() for x in v.split(",") if x.strip()]
 
 class SETTINGS:
-    # Universe of underlyings (liquid only!)
+    # Universe
     TICKERS = _get_csv("TICKERS", ["SPY","QQQ","AAPL","MSFT","NVDA","META","AMZN"])
 
-    # Contract selection
+    # Tradier API
+    TRADIER_TOKEN   = os.getenv("TRADIER_TOKEN", "")
+    TRADIER_BASE    = os.getenv("TRADIER_BASE", "https://sandbox.tradier.com")  # paper: sandbox; live: https://api.tradier.com
+    TRADIER_ACCOUNT = os.getenv("TRADIER_ACCOUNT", "")  # your account id (sandbox/live)
+
+    # Selection filters
     DTE_MIN = _get_int("DTE_MIN", 30)
     DTE_MAX = _get_int("DTE_MAX", 60)
     DELTA_MIN = _get_float("DELTA_MIN", 0.60)
     DELTA_MAX = _get_float("DELTA_MAX", 0.80)
-    OI_MIN   = _get_int("OI_MIN", 200)              # minimum open interest
-    VOL_MIN  = _get_int("VOL_MIN", 50)              # minimum daily volume
-    MAX_SPREAD_PCT = _get_float("MAX_SPREAD_PCT", 0.15)  # (ask-bid)/mid <= 15%
+    OI_MIN   = _get_int("OI_MIN", 200)
+    VOL_MIN  = _get_int("VOL_MIN", 50)
+    MAX_SPREAD_PCT = _get_float("MAX_SPREAD_PCT", 0.15)
 
-    # Entry confirmation on underlying (daily trend filter)
+    # Underlying daily trend (entry confirm)
     EMA_FAST = _get_int("EMA_FAST", 20)
     EMA_SLOW = _get_int("EMA_SLOW", 50)
     RSI_LEN  = _get_int("RSI_LEN", 14)
 
     # Exits (no fixed TP)
     ATR_LEN = _get_int("ATR_LEN", 14)
-    TRAIL_K_ATR = _get_float("TRAIL_K_ATR", 3.0)      # Chandelier ATR multiple
-    OPT_DD_EXIT = _get_float("OPT_DD_EXIT", 0.25)     # option peak drawdown 25%
-    DTE_TIME_STOP = _get_int("DTE_TIME_STOP", 7)      # exit if <= 7 days to expiry
+    TRAIL_K_ATR = _get_float("TRAIL_K_ATR", 3.0)     # chandelier multiple
+    OPT_DD_EXIT = _get_float("OPT_DD_EXIT", 0.25)    # option drawdown from peak (25%)
+    DTE_STOP    = _get_int("DTE_STOP", 7)            # force exit when ≤ 7 DTE
 
-    # Risk-free rate for Greeks (Black-Scholes)
-    RISK_FREE = _get_float("RISK_FREE", 0.045)        # 4.5% annualized
-    DIV_YIELD = _get_float("DIV_YIELD", 0.0)          # assume 0 unless set
+    # Position sizing (simple)
+    ORDER_QTY = _get_int("ORDER_QTY", 1)             # number of contracts per buy
 
-    # State / persistence
-    DB_PATH = os.getenv("DB_PATH", "./advisor.db")
+    # Execution
+    DRY_RUN  = _get_bool("DRY_RUN", True)            # true = simulate orders
+    DURATION = os.getenv("ORDER_DURATION", "day")    # day or gtc
 
-    # Runtime
+    # Persistence
+    DB_PATH = os.getenv("DB_PATH", "./executor_tradier.db")
+
+    # Logging
     VERBOSE = _get_bool("VERBOSE", True)
 
-# ------------- Math/Greeks (BS) -------------
-def _norm_cdf(x: float) -> float:
-    # standard normal CDF via erf
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-def bs_delta_call(S, K, T, r, q, sigma) -> float:
-    """
-    Black-Scholes call delta with continuous div yield q.
-    S: spot, K: strike, T: time in years, r: risk-free, q: dividend yield, sigma: volatility
-    """
-    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-        return 0.0
-    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
-    return math.exp(-q * T) * _norm_cdf(d1)
+# -------------------- HTTP / Tradier --------------------
+def _auth_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {SETTINGS.TRADIER_TOKEN}",
+        "Accept": "application/json",
+        "User-Agent": "OptionExecutor/1.0"
+    }
 
-# ------------- Indicators -------------
+def tget(path: str, params: Dict = None) -> Dict:
+    url = SETTINGS.TRADIER_BASE.rstrip("/") + path
+    r = requests.get(url, headers=_auth_headers(), params=params or {}, timeout=25)
+    r.raise_for_status()
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+def tpost(path: str, data: Dict) -> Dict:
+    url = SETTINGS.TRADIER_BASE.rstrip("/") + path
+    r = requests.post(
+        url,
+        headers={**_auth_headers(), "Content-Type": "application/x-www-form-urlencoded"},
+        data=data,
+        timeout=25
+    )
+    # Tradier returns 200 OK even on order rejects with error payloads; still raise for connectivity issues
+    try:
+        return r.json()
+    except Exception:
+        return {"raw": r.text, "status_code": r.status_code}
+
+# ---- Market data ----
+def tradier_quote(symbols: List[str]) -> Dict[str, Dict]:
+    symlist = ",".join(symbols)
+    data = tget("/v1/markets/quotes", {"symbols": symlist})
+    quotes = {}
+    q = (data.get("quotes") or {}).get("quote")
+    if q is None: return quotes
+    rows = q if isinstance(q, list) else [q]
+    for row in rows:
+        sym = str(row.get("symbol"))
+        quotes[sym] = row
+    return quotes
+
+def tradier_history_daily(symbol: str, days: int = 420) -> pd.DataFrame:
+    start = (datetime.utcnow() - timedelta(days=days+10)).date().isoformat()
+    data = tget("/v1/markets/history", {"symbol": symbol, "interval": "daily", "start": start})
+    hist = (data.get("history") or {}).get("day")
+    if not hist: return pd.DataFrame()
+    df = pd.DataFrame(hist)
+    for col in ("open","high","low","close","volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.rename(columns={"open":"High_open_ignore","high":"High","low":"Low","close":"Close","volume":"Volume"})
+    # The "open" key name conflict workaround above avoids accidental use; only High/Low/Close/Volume used here
+    df = df.set_index("date").sort_index()
+    return df
+
+def tradier_expirations(symbol: str) -> List[str]:
+    data = tget("/v1/markets/options/expirations", {
+        "symbol": symbol, "includeAllRoots": "true", "strikes": "false"
+    })
+    exps = (data.get("expirations") or {}).get("date")
+    if not exps: return []
+    return exps if isinstance(exps, list) else [exps]
+
+def tradier_chain(symbol: str, expiration: str) -> pd.DataFrame:
+    data = tget("/v1/markets/options/chains", {
+        "symbol": symbol, "expiration": expiration, "greeks": "true"
+    })
+    opts = (data.get("options") or {}).get("option")
+    if not opts: return pd.DataFrame()
+    df = pd.DataFrame(opts)
+    num_cols = ["strike","last","bid","ask","volume","open_interest","delta"]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+# ---- Accounts / Positions / Orders ----
+def tradier_positions() -> List[Dict]:
+    """
+    Returns list of positions (including options) for the account.
+    """
+    if not SETTINGS.TRADIER_ACCOUNT:
+        return []
+    data = tget(f"/v1/accounts/{SETTINGS.TRADIER_ACCOUNT}/positions")
+    pos = (data.get("positions") or {}).get("position")
+    if not pos: return []
+    return pos if isinstance(pos, list) else [pos]
+
+def tradier_place_option_order(symbol_occ: str, side: str, qty: int, order_type: str = "limit", price: Optional[float] = None, duration: Optional[str] = None) -> Dict:
+    """
+    Place an options order. side ∈ {"buy_to_open","sell_to_close"}
+    order_type ∈ {"market","limit"}; duration like "day" or "gtc".
+    """
+    if SETTINGS.DRY_RUN:
+        return {"status": "dry_run", "symbol": symbol_occ, "side": side, "qty": qty, "type": order_type, "price": price, "duration": duration or SETTINGS.DURATION}
+
+    if not SETTINGS.TRADIER_ACCOUNT:
+        return {"error": "TRADIER_ACCOUNT not set"}
+
+    payload = {
+        "class": "option",
+        "symbol": symbol_occ,
+        "side": side,
+        "quantity": str(int(max(1, qty))),
+        "type": order_type,
+        "duration": duration or SETTINGS.DURATION,
+    }
+    if order_type == "limit":
+        if price is None:
+            return {"error": "limit order requires price"}
+        payload["price"] = f"{price:.02f}"
+
+    return tpost(f"/v1/accounts/{SETTINGS.TRADIER_ACCOUNT}/orders", payload)
+
+
+# -------------------- Indicators --------------------
 def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
 
@@ -105,29 +219,27 @@ def rsi(series: pd.Series, n: int = 14) -> pd.Series:
     return 100 - 100/(1+rs)
 
 def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    hi, lo, cl = df['High'], df['Low'], df['Close']
+    hi, lo, cl = df["High"], df["Low"], df["Close"]
     prev = cl.shift(1)
-    tr = pd.concat([
-        (hi - lo).abs(),
-        (hi - prev).abs(),
-        (lo - prev).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([(hi - lo).abs(), (hi - prev).abs(), (lo - prev).abs()], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
 def daily_trend_ok(df: pd.DataFrame) -> bool:
-    """
-    Basic confirmation: EMA20 > EMA50 and RSI > 50 rising.
-    """
+    if df is None or df.empty:
+        return False
     if len(df) < max(SETTINGS.EMA_SLOW+5, SETTINGS.RSI_LEN+5):
         return False
-    close = df['Close']
-    e20, e50 = ema(close, SETTINGS.EMA_FAST), ema(close, SETTINGS.EMA_SLOW)
+    close = df["Close"]
+    e_fast = ema(close, SETTINGS.EMA_FAST)
+    e_slow = ema(close, SETTINGS.EMA_SLOW)
     r = rsi(close, SETTINGS.RSI_LEN)
-    cond1 = e20.iloc[-1] > e50.iloc[-1]
-    cond2 = r.iloc[-1] > 50 and r.iloc[-1] >= r.iloc[-2]
-    return bool(cond1 and cond2)
+    return bool((e_fast.iloc[-1] > e_slow.iloc[-1]) and (r.iloc[-1] > 50) and (r.iloc[-1] >= r.iloc[-2]))
 
-# ------------- SQLite state -------------
+def chandelier_trail(highest_close: float, atr_val: float) -> float:
+    return highest_close - SETTINGS.TRAIL_K_ATR * atr_val
+
+
+# -------------------- SQLite State --------------------
 def db_init():
     con = sqlite3.connect(SETTINGS.DB_PATH)
     cur = con.cursor()
@@ -178,264 +290,243 @@ def db_delete_pick(contract: str):
     con.commit()
     con.close()
 
-# ------------- Helpers -------------
+def db_update_pick(contract: str, highest_close: float, trail: float, peak_option: float):
+    con = sqlite3.connect(SETTINGS.DB_PATH)
+    con.execute("UPDATE picks SET highest_close=?, trail=?, peak_option=? WHERE contract=?;", (highest_close, trail, peak_option, contract))
+    con.commit()
+    con.close()
+
+
+# -------------------- Selection / Execution --------------------
 @dataclass
 class OptionCandidate:
     ticker: str
     contract: str
     expiry: str
     strike: float
+    bid: float
+    ask: float
     mid: float
     delta: float
     dte: int
-    bid: float
-    ask: float
-    iv: float
 
-def pick_best_call(ticker: str, price_now: float, chain_df: pd.DataFrame, today: pd.Timestamp) -> Optional[OptionCandidate]:
-    """
-    From a chain dataframe (calls), select the best contract per filters.
-    Uses Yahoo-provided IV; computes delta via BS for consistency.
-    """
-    if chain_df is None or chain_df.empty:
-        return None
+def pick_best_call_from_chain(ticker: str, spot: float, expiration: str, today_utc: datetime) -> Optional[OptionCandidate]:
+    df = tradier_chain(ticker, expiration)
+    if df is None or df.empty: return None
+    calls = df[df.get("option_type") == "call"].copy()
+    if calls.empty: return None
 
-    # required Yahoo columns (yfinance typically provides these)
-    required = {'contractSymbol','strike','lastPrice','bid','ask','impliedVolatility','lastTradeDate','inTheMoney','volume','openInterest','expiration'}
-    if not required.issubset(chain_df.columns):
-        return None
-
-    candidates: List[OptionCandidate] = []
-    for _, row in chain_df.iterrows():
-        exp = pd.to_datetime(row['expiration'])
-        dte = max(0, (exp.normalize() - today.normalize()).days)
-        if not (SETTINGS.DTE_MIN <= dte <= SETTINGS.DTE_MAX):
-            continue
-
-        bid = float(row['bid'] or 0.0)
-        ask = float(row['ask'] or 0.0)
-        if bid <= 0 or ask <= 0 or ask < bid:
-            continue
-        mid = (bid + ask) / 2.0
-        spread_pct = (ask - bid) / max(mid, 1e-9)
-        if spread_pct > SETTINGS.MAX_SPREAD_PCT:
-            continue
-
-        oi = int(row.get('openInterest') or 0)
-        vol = int(row.get('volume') or 0)
-        if oi < SETTINGS.OI_MIN or vol < SETTINGS.VOL_MIN:
-            continue
-
-        K = float(row['strike'])
-        iv = float(row.get('impliedVolatility') or 0.0)
-        # yfinance gives IV as 0.20 for 20% (already decimal). If it looks like 20.0, convert:
-        if iv > 3.0:  # assume percentage entered as 20 rather than 0.20
-            iv = iv / 100.0
-
-        T = max(1/365, dte / 365.0)
-        delta = bs_delta_call(price_now, K, T, SETTINGS.RISK_FREE, SETTINGS.DIV_YIELD, max(iv, 1e-6))
-
-        if not (SETTINGS.DELTA_MIN <= delta <= SETTINGS.DELTA_MAX):
-            continue
-
-        candidates.append(OptionCandidate(
-            ticker=ticker,
-            contract=str(row['contractSymbol']),
-            expiry=exp.date().isoformat(),
-            strike=K,
-            mid=mid,
-            delta=delta,
-            dte=dte,
-            bid=bid,
-            ask=ask,
-            iv=iv
-        ))
-
-    if not candidates:
-        return None
-
-    # Rank: closest to mid-delta range center, then tighter spread, then higher OI (if available)
-    target = (SETTINGS.DELTA_MIN + SETTINGS.DELTA_MAX) / 2.0
-    candidates.sort(key=lambda c: (abs(c.delta - target), (c.ask - c.bid)/max(c.mid, 1e-9), -c.mid))
-    return candidates[0]
-
-def chandelier_trail(highest_close: float, atr_val: float) -> float:
-    return highest_close - SETTINGS.TRAIL_K_ATR * atr_val
-
-def update_trailing(highest_close: float, price_close: float, atr_val: float) -> Tuple[float, float]:
-    new_high = max(highest_close, price_close)
-    return new_high, chandelier_trail(new_high, atr_val)
-
-# ------------- Core run -------------
-def process_ticker(ticker: str):
-    tk = yf.Ticker(ticker)
-    today = pd.Timestamp.utcnow().tz_localize("UTC")
-
-    # Daily history for trend and ATR
+    # compute DTE
     try:
-        hist = tk.history(period="1y", interval="1d", auto_adjust=False)
-        if hist is None or hist.empty:
-            print(f"[WARN] No daily data for {ticker}")
-            return
-    except Exception as e:
-        print(f"[ERR] Daily fetch {ticker}: {e}")
-        return
+        exp_dt = datetime.fromisoformat(expiration)
+    except Exception:
+        exp_dt = datetime.strptime(expiration, "%Y-%m-%d")
+    dte = max(0, (exp_dt.date() - today_utc.date()).days)
+    if dte < SETTINGS.DTE_MIN or dte > SETTINGS.DTE_MAX:
+        return None
 
+    # clean numeric
+    for c in ["bid","ask","volume","open_interest","delta","strike"]:
+        if c in calls.columns:
+            calls[c] = pd.to_numeric(calls[c], errors="coerce")
+    calls["mid"] = (calls["bid"] + calls["ask"]) / 2.0
+    calls = calls[(calls["bid"] > 0) & (calls["ask"] > 0) & (calls["ask"] >= calls["bid"])]
+    calls["spread_pct"] = (calls["ask"] - calls["bid"]) / calls["mid"].clip(lower=1e-9)
+
+    # liquidity / spread / delta
+    calls = calls[
+        (calls["open_interest"] >= SETTINGS.OI_MIN) &
+        (calls["volume"] >= SETTINGS.VOL_MIN) &
+        (calls["spread_pct"] <= SETTINGS.MAX_SPREAD_PCT) &
+        (calls["delta"] >= SETTINGS.DELTA_MIN) &
+        (calls["delta"] <= SETTINGS.DELTA_MAX)
+    ]
+    if calls.empty: return None
+
+    target = 0.5 * (SETTINGS.DELTA_MIN + SETTINGS.DELTA_MAX)
+    calls["delta_rank"] = (calls["delta"] - target).abs()
+    calls = calls.sort_values(by=["delta_rank", "spread_pct", "mid"], ascending=[True, True, False])
+    best = calls.iloc[0]
+
+    return OptionCandidate(
+        ticker=ticker,
+        contract=str(best.get("symbol")),
+        expiry=expiration,
+        strike=float(best.get("strike")),
+        bid=float(best.get("bid")),
+        ask=float(best.get("ask")),
+        mid=float(best.get("mid")),
+        delta=float(best.get("delta")),
+        dte=dte
+    )
+
+def already_holding_contract(positions: List[Dict], occ_symbol: str) -> bool:
+    for p in positions:
+        sym = str(p.get("symbol") or "")
+        if sym == occ_symbol:
+            qty = float(p.get("quantity") or 0)
+            if qty > 0:
+                return True
+    return False
+
+
+# -------------------- Management (exits) --------------------
+def manage_open_picks_for_ticker(ticker: str, spot_now: float, atr_val: float, positions: List[Dict]):
+    picks = [p for p in db_get_picks() if p["ticker"] == ticker]
+    if not picks: return
+
+    for p in picks:
+        prev_high = float(p["highest_close"])
+        new_high = max(prev_high, spot_now)
+        new_trail = chandelier_trail(new_high, atr_val)
+
+        # option mid from quotes
+        q = tradier_quote([p["contract"]]).get(p["contract"], {})
+        bid = float(q.get("bid") or 0.0)
+        ask = float(q.get("ask") or 0.0)
+        mid_now = (bid + ask) / 2.0 if (bid > 0 and ask > 0 and ask >= bid) else float(p["entry_option"])
+        new_peak = max(float(p["peak_option"]), mid_now)
+
+        # Exit logic
+        reason = None
+        if spot_now < new_trail:
+            reason = "trail_stop"
+        elif new_peak > 0 and mid_now <= new_peak * (1.0 - SETTINGS.OPT_DD_EXIT):
+            reason = "option_peak_drawdown"
+        else:
+            # time stop
+            try:
+                exp_dt = datetime.fromisoformat(p["expiry"])
+            except Exception:
+                exp_dt = datetime.strptime(p["expiry"], "%Y-%m-%d")
+            dte = max(0, (exp_dt.date() - datetime.utcnow().date()).days)
+            if dte <= SETTINGS.DTE_STOP:
+                reason = "time_stop"
+
+        if reason:
+            # Place SELL if we actually hold the contract
+            if already_holding_contract(positions, p["contract"]):
+                order = tradier_place_option_order(
+                    symbol_occ=p["contract"],
+                    side="sell_to_close",
+                    qty=SETTINGS.ORDER_QTY,
+                    order_type="market",  # market out for certainty; you can switch to limit=bid
+                    price=None
+                )
+                print(f"SELL {ticker} | {p['contract']} | reason={reason} | mid≈{mid_now:.2f} | resp={json.dumps(order)}")
+            else:
+                print(f"SELL SIGNAL (no position) {ticker} | {p['contract']} | reason={reason} | mid≈{mid_now:.2f}")
+
+            db_delete_pick(p["contract"])
+        else:
+            db_update_pick(p["contract"], new_high, new_trail, new_peak)
+
+
+# -------------------- Core flow --------------------
+def process_ticker(ticker: str, positions: List[Dict]):
+    # 1) daily history
+    hist = tradier_history_daily(ticker, days=420)
+    if hist is None or hist.empty:
+        if SETTINGS.VERBOSE: print(f"[WARN] no daily for {ticker}")
+        return
     if not daily_trend_ok(hist):
         return
+    spot_now = float(hist["Close"].iloc[-1])
+    atr_val = float(atr(hist, SETTINGS.ATR_LEN).iloc[-1])
 
-    price_now = float(hist['Close'].iloc[-1])
-    atr_val = float(atr(hist.rename(columns={"High":"High","Low":"Low","Close":"Close"}), SETTINGS.ATR_LEN).iloc[-1])
+    # 2) expirations
+    exps = tradier_expirations(ticker)
+    if not exps: return
 
-    # Options expirations
-    try:
-        exps = tk.options
-    except Exception as e:
-        print(f"[ERR] Expirations {ticker}: {e}")
-        return
-    if not exps:
-        return
-
-    best_pick: Optional[OptionCandidate] = None
+    # 3) pick best call
+    today_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+    best_pick = None
     for exp in exps:
-        # Only fetch relevant expiries lazily
-        exp_dt = pd.to_datetime(exp)
-        dte = max(0, (exp_dt.normalize() - today.normalize()).days)
-        if not (SETTINGS.DTE_MIN <= dte <= SETTINGS.DTE_MAX):
-            continue
         try:
-            chain = tk.option_chain(exp)
-            calls = chain.calls.copy()
-            if 'expiration' not in calls.columns:
-                calls['expiration'] = exp
-            pick = pick_best_call(ticker, price_now, calls, today)
-            if pick:
-                best_pick = pick
-                break  # take first valid expiry in window
-        except Exception as e:
-            if SETTINGS.VERBOSE:
-                print(f"[WARN] Option chain fetch {ticker} {exp}: {e}")
-            continue
+            # quick window check
+            try:
+                exp_dt = datetime.fromisoformat(exp)
+            except Exception:
+                exp_dt = datetime.strptime(exp, "%Y-%m-%d")
+            dte = max(0, (exp_dt.date() - today_utc.date()).days)
+            if dte < SETTINGS.DTE_MIN or dte > SETTINGS.DTE_MAX:
+                continue
 
-    # If we found a candidate and it isn't already open, emit BUY signal + save state
+            cand = pick_best_call_from_chain(ticker, spot_now, exp, today_utc)
+            if cand:
+                best_pick = cand
+                break
+        except Exception as e:
+            if SETTINGS.VERBOSE: print(f"[WARN] chain {ticker} {exp}: {e}")
+
+    # 4) BUY if candidate found and not already held or in picks
     if best_pick:
-        # Check if already open
-        open_now = db_get_picks()
-        if any(p['contract'] == best_pick.contract for p in open_now):
-            # Already tracking; we'll manage it in the manage step below
-            pass
-        else:
-            # initial trail from chandelier using current ATR/daily close
-            highest_close = price_now
+        in_db = any(p["contract"] == best_pick.contract for p in db_get_picks())
+        have_pos = already_holding_contract(positions, best_pick.contract)
+
+        if not have_pos and not in_db:
+            # entry price hint: limit at min(ask, mid*1.02)
+            limit_price = round(min(best_pick.ask, best_pick.mid * 1.02), 2)
+
+            if SETTINGS.ORDER_QTY <= 0:
+                print(f"BUY SIGNAL (config ORDER_QTY<=0): {ticker} | {best_pick.contract} | mid≈{best_pick.mid:.2f}")
+            else:
+                order = tradier_place_option_order(
+                    symbol_occ=best_pick.contract,
+                    side="buy_to_open",
+                    qty=SETTINGS.ORDER_QTY,
+                    order_type="limit",
+                    price=limit_price,
+                    duration=SETTINGS.DURATION
+                )
+                print(f"BUY {ticker} | {best_pick.contract} | Δ≈{best_pick.delta:.2f} | "
+                      f"limit≤{limit_price:.2f} | resp={json.dumps(order)}")
+
+            # track in DB regardless of immediate fill status (we manage via exits)
+            highest_close = spot_now
             trail = chandelier_trail(highest_close, atr_val)
-            # Persist
             db_insert_pick({
                 "ticker": ticker,
                 "contract": best_pick.contract,
                 "expiry": best_pick.expiry,
                 "strike": best_pick.strike,
                 "delta": best_pick.delta,
-                "entry_underlying": price_now,
+                "entry_underlying": spot_now,
                 "entry_option": best_pick.mid,
                 "highest_close": highest_close,
                 "trail": trail,
                 "peak_option": best_pick.mid,
                 "created_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
             })
-            # Signal
-            limit_hint = round(best_pick.mid * 1.02, 2)  # +2% over mid as a sanity limit suggestion
-            print(f"BUY SIGNAL: {ticker}  |  {best_pick.contract}  exp {best_pick.expiry}  "
-                  f"strike {best_pick.strike:.2f}  Δ≈{best_pick.delta:.2f}  IV≈{best_pick.iv:.2%}  "
-                  f"mid≈{best_pick.mid:.2f}  suggest limit≤{limit_hint:.2f}")
 
-    # Manage any open picks for this ticker (SELL signals)
-    manage_open_picks_for_ticker(ticker, tk, price_now, atr_val)
+    # 5) Manage exits for this ticker
+    manage_open_picks_for_ticker(ticker, spot_now, atr_val, positions)
 
-def manage_open_picks_for_ticker(ticker: str, tk: yf.Ticker, price_now: float, atr_val: float):
-    picks = [p for p in db_get_picks() if p['ticker'] == ticker]
-    if not picks:
+
+def run_once():
+    # validate env
+    missing = []
+    if not SETTINGS.TRADIER_TOKEN: missing.append("TRADIER_TOKEN")
+    if not SETTINGS.TRADIER_ACCOUNT and not SETTINGS.DRY_RUN: missing.append("TRADIER_ACCOUNT")
+    if missing:
+        print("[ERROR] missing env:", ", ".join(missing))
         return
 
-    # Update trailing stop from underlying
-    highest_close = None
-    trail = None
-
-    for p in picks:
-        # refresh underlying trail
-        prev_high = float(p['highest_close'])
-        new_high, new_trail = update_trailing(prev_high, price_now, atr_val)
-
-        # fetch current option quote (mid)
-        try:
-            # Extract from contract symbol: e.g., AAPL240118C00160000
-            opt_tk = yf.Ticker(p['contract'])
-            opt_hist = opt_tk.history(period="1d", interval="1m")  # intraday may be sparse; fallback to fast call
-            # if no intraday, try fast .info; yfinance may have 'bid','ask' in .fast_info
-            if opt_hist is not None and not opt_hist.empty:
-                opt_last = float(opt_hist['Close'].iloc[-1])
-                bid = ask = None
-                mid_now = opt_last  # crude fallback
-            else:
-                fi = getattr(opt_tk, "fast_info", None)
-                bid = float(getattr(fi, "bid", 0.0) or 0.0) if fi else 0.0
-                ask = float(getattr(fi, "ask", 0.0) or 0.0) if fi else 0.0
-                if bid > 0 and ask > 0 and ask >= bid:
-                    mid_now = (bid + ask) / 2.0
-                else:
-                    # one more fallback: daily option data
-                    daily_opt = opt_tk.history(period="5d", interval="1d")
-                    mid_now = float(daily_opt['Close'].iloc[-1]) if daily_opt is not None and not daily_opt.empty else float(p['entry_option'])
-        except Exception:
-            mid_now = float(p['entry_option'])
-
-        # update peak option price
-        peak = max(float(p['peak_option']), mid_now)
-
-        # Exit rules:
-        reason = None
-        # A) Underlying chandelier stop
-        if price_now < new_trail:
-            reason = "trail_stop"
-        # B) Option peak drawdown
-        elif peak > 0 and (mid_now <= peak * (1.0 - SETTINGS.OPT_DD_EXIT)):
-            reason = "option_peak_drawdown"
-        # C) Time stop (close to expiry)
-        else:
-            # Parse ISO expiry
-            try:
-                exp = pd.to_datetime(p['expiry'])
-                dte = max(0, (exp.normalize() - pd.Timestamp.utcnow().tz_localize("UTC").normalize()).days)
-                if dte <= SETTINGS.DTE_TIME_STOP:
-                    reason = "time_stop"
-            except Exception:
-                pass
-
-        if reason:
-            print(f"SELL SIGNAL: {ticker}  |  {p['contract']}  reason={reason}  "
-                  f"trail≈{new_trail:.2f}  underlying≈{price_now:.2f}  opt≈{mid_now:.2f}")
-            db_delete_pick(p['contract'])
-        else:
-            # persist updated trail/high/peak
-            con = sqlite3.connect(SETTINGS.DB_PATH)
-            cur = con.cursor()
-            cur.execute("""
-                UPDATE picks
-                SET highest_close=?, trail=?, peak_option=?
-                WHERE contract=?;
-            """, (new_high, new_trail, peak, p['contract']))
-            con.commit()
-            con.close()
-
-# ------------- Runner -------------
-def run_once():
     db_init()
+    # pull positions once for this run
+    positions = tradier_positions() if not SETTINGS.DRY_RUN else []
     for t in SETTINGS.TICKERS:
         try:
-            process_ticker(t)
+            process_ticker(t, positions)
         except Exception as e:
             if SETTINGS.VERBOSE:
                 print(f"[ERR] process {t}: {e}")
 
+
 if __name__ == "__main__":
+    # Runs once (best with Railway Cron: e.g., every 15m)
     run_once()
-    # For Railway Cron, just schedule: python main.py
+    # For perpetual mode (optional):
+    # while True:
+    #     run_once()
+    #     time.sleep(900)
