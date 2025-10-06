@@ -1,12 +1,13 @@
 # ==========================================================
-# OptionExecutor v2.2.1 — S&P 500 via CSV mirrors (no lxml) → Alpaca screener → Tradier options
-# - S&P 500 list fetched from CSV mirrors (GitHub/DataHub). No pandas.read_html, no lxml needed.
-# - Screener: EMA20 > EMA50 & RSI(14) > 50 rising (daily bars via Alpaca)
-# - Options: Tradier chains (greeks flattened). Correct order fields:
+# OptionExecutor v2.3 — S&P 500 (CSV) → Alpaca Screener → Tradier Options
+# - S&P 500 list from CSV mirrors (no lxml). Small fallback if mirrors fail.
+# - Screener: EMA20 > EMA50 and RSI(14) > 50 and rising (Alpaca daily bars).
+# - Options: Tradier chains (greeks flattened) + correct order fields:
 #       symbol=<UNDERLYING>, option_symbol=<OCC>
-# - Throttling: Alpaca delay & Tradier ~1 req/sec
-# - Startup: sanity checks (market clock, profile, balances, env echo)
-# - Logging: set DEBUG=true for verbose progress
+# - Throttling: Alpaca delay & Tradier ~1 req/sec.
+# - Startup: sanity checks (market clock, profile, balances, env echo).
+# - Duplicate protection: one open position per ticker/contract (DB + broker check).
+# - Logging: set DEBUG=true for verbose progress details.
 # ==========================================================
 
 import os, json, sqlite3, time, requests, pandas as pd
@@ -70,7 +71,7 @@ def _alpaca_headers():
         "APCA-API-KEY-ID": S.ALPACA_KEY,
         "APCA-API-SECRET-KEY": S.ALPACA_SECRET,
         "Accept": "application/json",
-        "User-Agent": "OptionExecutor/2.2.1 (+S&P500 screener)"
+        "User-Agent": "OptionExecutor/2.3 (+S&P500 screener)"
     }
 
 def _alpaca_get(path, params=None):
@@ -89,7 +90,7 @@ def _tradier_headers():
     return {
         "Authorization": f"Bearer {S.TRADIER_TOKEN}",
         "Accept": "application/json",
-        "User-Agent": "OptionExecutor/2.2.1"
+        "User-Agent": "OptionExecutor/2.3"
     }
 
 def _tradier_get(path, params=None):
@@ -177,36 +178,29 @@ _FALLBACK_SP500 = [
 ]
 
 _SP500_SOURCES = [
-    # GitHub dataset (commonly mirrored)
     "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
-    # DataHub mirror
     "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv",
 ]
 
 def sp500_symbols() -> List[str]:
     sess = requests.Session()
-    sess.headers.update({"User-Agent": "Mozilla/5.0 OptionExecutor/2.2.1"})
+    sess.headers.update({"User-Agent": "Mozilla/5.0 OptionExecutor/2.3"})
     for src in _SP500_SOURCES:
         try:
             r = sess.get(src, timeout=30)
             r.raise_for_status()
             text = r.text
-            # Parse CSV manually to avoid pandas.read_csv edge deps if you want
-            # but pandas.read_csv is fine (no lxml required)
             from io import StringIO
             df = pd.read_csv(StringIO(text))
-            # Column might be 'Symbol' or 'Ticker'
             for col in ["Symbol", "Ticker", "symbol", "ticker"]:
                 if col in df.columns:
                     syms = [str(x).strip().upper().replace(" ", "") for x in df[col].tolist()]
-                    # Normalize weird unicode and dots
                     syms = [s.replace("\u200a", "").replace("\u00b7",".") for s in syms]
-                    # Dedup preserve order
                     seen=set(); out=[]
                     for s in syms:
                         if s and s not in seen:
                             out.append(s); seen.add(s)
-                    if len(out) >= 450:  # sanity: should be near 500
+                    if len(out) >= 450:  # sanity check
                         if DEBUG:
                             print(f"[INFO] S&P 500 fetched from {src}: {len(out)} symbols")
                         return out
@@ -277,6 +271,12 @@ def tradier_quote(sym_occ: str) -> Dict:
     d = _tradier_get("/v1/markets/quotes", {"symbols": sym_occ})
     return (d.get("quotes") or {}).get("quote") or {}
 
+def tradier_positions() -> List[Dict]:
+    if not S.TRADIER_ACCOUNT: return []
+    d = _tradier_get(f"/v1/accounts/{S.TRADIER_ACCOUNT}/positions")
+    p = (d.get("positions") or {}).get("position")
+    return p if isinstance(p, list) else ([p] if p else [])
+
 def tradier_order(underlying: str, occ_symbol: str, side: str, qty: int, otype="limit", price=None, preview=False):
     if S.DRY_RUN:
         print("[DRY_RUN] order", {"underlying": underlying, "occ": occ_symbol, "side": side, "qty": qty, "type": otype, "price": price})
@@ -325,6 +325,40 @@ def sanity_check_tradier():
             print("[CHECK] existing orders:", ords)
     except Exception as e:
         print("[CHECK] account error:", e)
+
+# -------------------- Duplicate-protection helpers --------------------
+def has_open_pick_in_db(ticker: str, occ: Optional[str] = None) -> bool:
+    con = sqlite3.connect(S.DB); con.row_factory = sqlite3.Row
+    if occ:
+        r = con.execute("SELECT 1 FROM picks WHERE contract=?", (occ,)).fetchone()
+    else:
+        r = con.execute("SELECT 1 FROM picks WHERE ticker=?", (ticker,)).fetchone()
+    con.close()
+    return r is not None
+
+def has_tradier_position(ticker: str, occ: Optional[str] = None) -> bool:
+    try:
+        poss = tradier_positions()
+    except Exception:
+        return False
+    if not poss:
+        return False
+    items = poss if isinstance(poss, list) else [poss]
+    for p in items:
+        sym = str(p.get("symbol",""))           # often OCC for options
+        und = str(p.get("underlying",""))       # sometimes present
+        if occ:
+            if sym == occ:
+                return True
+        else:
+            if und == ticker or sym.startswith(ticker):
+                return True
+    return False
+
+def already_holding(ticker: str, occ: str) -> bool:
+    # Block if either DB or broker shows we're already in this ticker/contract
+    return has_open_pick_in_db(ticker) or has_open_pick_in_db(ticker, occ) or \
+           has_tradier_position(ticker) or has_tradier_position(ticker, occ)
 
 # -------------------- Options selection --------------------
 @dataclass
@@ -417,6 +451,12 @@ def process_candidate_tradier(t: str, cnt: Dict[str,int]):
     if not best:
         if DEBUG: print(f"[NO OPTIONS] {t}: no viable calls in window")
         return
+
+    # --------- prevent duplicates across runs ---------
+    if already_holding(t, best.contract):
+        print(f"[SKIP] {t}: already holding {t} or {best.contract}")
+        return
+
     cnt["viable"] += 1
     limit = round(min(best.ask, best.mid * 1.02), 2)
     print(f"BUY {t} {best.contract} Δ={best.delta:.2f} @{limit}")
