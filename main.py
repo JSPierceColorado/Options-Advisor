@@ -10,12 +10,14 @@
 # - Logging: set DEBUG=true for verbose progress details.
 # - Tightened: safer trend checks, robust ATR, expiration scored by target DTE,
 #              stricter liquidity, improved duplicate detection.
+# - Market-hours gating: skip new buys outside RTH (holiday-aware via Tradier).
 # ==========================================================
 
 import os, json, sqlite3, time, requests, pandas as pd
 from datetime import datetime, timedelta, UTC
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo  # NEW
 
 # -------------------- Settings --------------------
 def _b(name, d):
@@ -61,6 +63,11 @@ class S:
     # --- Orders / persistence ---
     QTY = _i("ORDER_QTY", 1)
     DB  = os.getenv("DB_PATH", "./executor_tradier.db")
+
+    # --- Trading session guards (NEW) ---
+    ALLOW_AFTER_HOURS = _b("ALLOW_AFTER_HOURS", False)
+    SKIP_OPEN_MIN     = _i("SKIP_OPEN_MIN", 5)    # minutes after 09:30 ET
+    SKIP_CLOSE_MIN    = _i("SKIP_CLOSE_MIN", 10)  # minutes before 16:00 ET
 
     # --- Logging ---
     VERBOSE = _b("VERBOSE", True)
@@ -118,6 +125,58 @@ def _tradier_post(path, data):
     time.sleep(S.TRADIER_API_DELAY)
     return data
 
+# -------------------- Time/session helpers (NEW) --------------------
+def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
+    if not ts: return None
+    try:
+        ts = ts.replace("Z", "+00:00")
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+def _et_now() -> datetime:
+    try:
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return datetime.now().astimezone()
+
+def market_open_rth() -> bool:
+    """
+    True only during regular market session (holiday-aware via Tradier),
+    with small buffers at open/close.
+    """
+    try:
+        clk = _tradier_get("/v1/markets/clock") or {}
+        c = clk.get("clock") or clk
+        state = str(c.get("state", "")).lower()
+        if state != "open":
+            return False
+
+        now = _parse_iso(c.get("timestamp")) or datetime.now(UTC)
+        nxt = _parse_iso(c.get("next_change"))
+        if nxt:
+            mins_to_close = (nxt - now).total_seconds() / 60.0
+            if mins_to_close < S.SKIP_CLOSE_MIN:
+                return False
+
+        et = _et_now()
+        start = et.replace(hour=9, minute=30, second=0, microsecond=0)
+        if et < start + timedelta(minutes=S.SKIP_OPEN_MIN):
+            return False
+
+        if et.weekday() >= 5:
+            return False
+        return True
+    except Exception:
+        et = _et_now()
+        if et.weekday() >= 5:
+            return False
+        start = et.replace(hour=9, minute=30, second=0, microsecond=0)
+        end   = et.replace(hour=16, minute=0,  second=0, microsecond=0)
+        if et < start + timedelta(minutes=S.SKIP_OPEN_MIN): return False
+        if et > end - timedelta(minutes=S.SKIP_CLOSE_MIN):  return False
+        return start <= et <= end
+
 # -------------------- Indicators --------------------
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
@@ -133,9 +192,9 @@ def atr(df, n=14):
     tr = pd.concat([(h - l).abs(), (h - p).abs(), (l - p).abs()], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
-def chandelier(high, atrv): 
+def chandelier(high, atrv):
     if atrv is None:
-        return high  # fallback to a neutral trail if ATR not yet available
+        return high
     return high - S.TRAIL_K * atrv
 
 def trend_ok(df):
@@ -180,7 +239,6 @@ def db_del(c):
 
 # -------------------- S&P 500 universe (CSV mirrors; no lxml) --------------------
 _FALLBACK_SP500 = [
-    # Tiny fallback subset in case all remote sources fail
     "AAPL","MSFT","AMZN","GOOGL","META","NVDA","BRK.B","JPM","JNJ","XOM",
     "V","PG","MA","AVGO","HD","KO","PEP","PFE","ABBV","BAC"
 ]
@@ -208,7 +266,7 @@ def sp500_symbols() -> List[str]:
                     for s in syms:
                         if s and s not in seen:
                             out.append(s); seen.add(s)
-                    if len(out) >= 450:  # sanity check
+                    if len(out) >= 450:
                         if DEBUG:
                             print(f"[INFO] S&P 500 fetched from {src}: {len(out)} symbols")
                         return out
@@ -353,19 +411,17 @@ def has_tradier_position(ticker: str, occ: Optional[str] = None) -> bool:
         return False
     items = poss if isinstance(poss, list) else [poss]
     for p in items:
-        sym = str(p.get("symbol",""))           # often OCC for options
-        und = str(p.get("underlying",""))       # sometimes present
+        sym = str(p.get("symbol",""))
+        und = str(p.get("underlying",""))
         if occ:
             if sym == occ:
                 return True
         else:
-            # exact matches only; avoid prefix false-positives
             if und == ticker or sym == ticker or sym.split(' ')[0] == ticker:
                 return True
     return False
 
 def already_holding(ticker: str, occ: str) -> bool:
-    # Block if either DB or broker shows we're already in this ticker/contract
     return has_open_pick_in_db(ticker) or has_open_pick_in_db(ticker, occ) or \
            has_tradier_position(ticker) or has_tradier_position(ticker, occ)
 
@@ -384,7 +440,6 @@ def pick_call_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
     calls = df[df.get("option_type") == "call"].copy()
     if calls.empty: return None
 
-    # DTE window
     try: exp_dt = datetime.fromisoformat(exp)
     except Exception: exp_dt = datetime.strptime(exp, "%Y-%m-%d")
     dte = max(0, (exp_dt.date() - today.date()).days)
@@ -394,7 +449,6 @@ def pick_call_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
     for c in ["bid","ask","volume","open_interest","delta","strike"]:
         if c in calls.columns:
             calls[c] = pd.to_numeric(calls[c], errors="coerce")
-    # positive, nonzero, sane spread
     calls = calls[(calls["bid"] > 0) & (calls["ask"] > 0) & (calls["ask"] >= calls["bid"])]
     if calls.empty: return None
 
@@ -402,7 +456,6 @@ def pick_call_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
     calls = calls[calls["mid"] > 0.01]
     calls["spr"] = (calls["ask"] - calls["bid"]) / calls["mid"].clip(1e-9)
 
-    # Liquidity + spread + delta band (tightened)
     calls = calls[
         (calls["open_interest"] >= S.OI_MIN) &
         (calls["volume"] >= S.VOL_MIN) &
@@ -411,7 +464,6 @@ def pick_call_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
     ]
     if calls.empty: return None
 
-    # Rank around target delta; favor tighter spread and better mid/oi
     target = 0.5*(S.DELTA_MIN + S.DELTA_MAX)  # ~ +0.70
     calls["drank"] = (calls["delta"] - target) ** 2
     best = calls.sort_values(by=["drank","spr","mid","open_interest"], ascending=[True,True,False,False]).iloc[0]
@@ -425,7 +477,6 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
     if hist.empty: return
     spot = float(hist["Close"].iloc[-1])
 
-    # Robust ATR handling
     atr_series = atr(hist, S.ATR_LEN)
     atr_val = float(atr_series.dropna().iloc[-1]) if atr_series.notna().any() else None
 
@@ -457,13 +508,17 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
 
 # -------------------- Candidate processing --------------------
 def process_candidate_tradier(t: str, cnt: Dict[str,int]):
+    # extra safety: don't buy if market closed
+    if not S.ALLOW_AFTER_HOURS and not market_open_rth():
+        if DEBUG: print(f"[SKIP] {t}: market not open for new buys")
+        return
+
     hist = tradier_history_daily(t, 420)
     if hist.empty:
         if DEBUG: print(f"[SKIP] {t}: no Tradier history")
         return
     spot = float(hist["Close"].iloc[-1])
 
-    # ATR/trail at entry if available
     atr_series = atr(hist, S.ATR_LEN)
     atr_val = float(atr_series.dropna().iloc[-1]) if atr_series.notna().any() else None
 
@@ -485,7 +540,6 @@ def process_candidate_tradier(t: str, cnt: Dict[str,int]):
 
     best = min(scored, key=lambda x: x[0])[1]
 
-    # --------- prevent duplicates across runs ---------
     if already_holding(t, best.contract):
         print(f"[SKIP] {t}: already holding {t} or {best.contract}")
         return
@@ -534,28 +588,32 @@ def run_once():
     syms = sp500_symbols()
     print(f"[INFO] Universe: S&P 500 symbols={len(syms)}")
 
-    # 2) Screen each symbol (EMA/RSI)
-    candidates: List[str] = []
-    for i, sym in enumerate(syms, 1):
-        try:
-            if DEBUG and i % 50 == 1:
-                print(f"[PROGRESS] Screening {i}/{len(syms)}…")
-            if screen_symbol(sym):
-                candidates.append(sym)
-        except Exception as e:
-            print(f"[ERR][screen] {sym}: {e}")
-
-    print(f"[INFO] Candidates after screen: {len(candidates)}")
-
-    # 3) Options via Tradier ONLY for candidates (throttled)
     cnt={"viable":0,"buys":0,"sells":0}
-    for t in candidates:
-        try:
-            process_candidate_tradier(t, cnt)
-        except Exception as e:
-            print(f"[ERR] {t}: {e}")
 
-    # 4) Manage existing picks
+    # 2) Screen & buy only if market is open (or explicitly allowed)
+    if not S.ALLOW_AFTER_HOURS and not market_open_rth():
+        print("[MARKET CLOSED] Skipping screening & new buys; will still manage open positions.")
+    else:
+        candidates: List[str] = []
+        for i, sym in enumerate(syms, 1):
+            try:
+                if DEBUG and i % 50 == 1:
+                    print(f"[PROGRESS] Screening {i}/{len(syms)}…")
+                if screen_symbol(sym):
+                    candidates.append(sym)
+            except Exception as e:
+                print(f"[ERR][screen] {sym}: {e}")
+
+        print(f"[INFO] Candidates after screen: {len(candidates)}")
+
+        # 3) Options via Tradier ONLY for candidates (throttled)
+        for t in candidates:
+            try:
+                process_candidate_tradier(t, cnt)
+            except Exception as e:
+                print(f"[ERR] {t}: {e}")
+
+    # 4) Manage existing picks (always)
     open_ticks = sorted(set([p["ticker"] for p in db_all()]))
     for t in open_ticks:
         try:
@@ -563,7 +621,7 @@ def run_once():
         except Exception as e:
             print(f"[ERR][manage] {t}: {e}")
 
-    print(f"[SUMMARY] candidates={len(candidates)} viable={cnt['viable']} buys={cnt['buys']} sells={cnt['sells']}")
+    print(f"[SUMMARY] candidates={(cnt['viable']+0)} viable={cnt['viable']} buys={cnt['buys']} sells={cnt['sells']}")
 
 if __name__ == "__main__":
     run_once()
