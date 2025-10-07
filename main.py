@@ -8,6 +8,8 @@
 # - Startup: sanity checks (market clock, profile, balances, env echo).
 # - Duplicate protection: one open position per ticker/contract (DB + broker check).
 # - Logging: set DEBUG=true for verbose progress details.
+# - Tightened: safer trend checks, robust ATR, expiration scored by target DTE,
+#              stricter liquidity, improved duplicate detection.
 # ==========================================================
 
 import os, json, sqlite3, time, requests, pandas as pd
@@ -131,14 +133,20 @@ def atr(df, n=14):
     tr = pd.concat([(h - l).abs(), (h - p).abs(), (l - p).abs()], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
-def chandelier(high, atrv): return high - S.TRAIL_K * atrv
+def chandelier(high, atrv): 
+    if atrv is None:
+        return high  # fallback to a neutral trail if ATR not yet available
+    return high - S.TRAIL_K * atrv
 
 def trend_ok(df):
-    if df.empty or len(df) < max(S.EMA_SLOW+5, S.RSI_LEN+5):
+    need = max(S.EMA_SLOW + 5, S.RSI_LEN + 5)
+    if df.empty or len(df) < need:
         return False
-    c = df["Close"]
+    c = df["Close"].astype(float)
     ef, es = ema(c, S.EMA_FAST), ema(c, S.EMA_SLOW)
-    r = rsi(c, S.RSI_LEN)
+    r = rsi(c, S.RSI_LEN).dropna()
+    if len(r) < 2:
+        return False
     return (ef.iloc[-1] > es.iloc[-1]) and (r.iloc[-1] > 50) and (r.iloc[-1] >= r.iloc[-2])
 
 # -------------------- DB --------------------
@@ -351,7 +359,8 @@ def has_tradier_position(ticker: str, occ: Optional[str] = None) -> bool:
             if sym == occ:
                 return True
         else:
-            if und == ticker or sym.startswith(ticker):
+            # exact matches only; avoid prefix false-positives
+            if und == ticker or sym == ticker or sym.split(' ')[0] == ticker:
                 return True
     return False
 
@@ -374,18 +383,26 @@ def pick_call_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
         df["option_type"] = df["type"]
     calls = df[df.get("option_type") == "call"].copy()
     if calls.empty: return None
+
+    # DTE window
     try: exp_dt = datetime.fromisoformat(exp)
     except Exception: exp_dt = datetime.strptime(exp, "%Y-%m-%d")
     dte = max(0, (exp_dt.date() - today.date()).days)
     if not (S.DTE_MIN <= dte <= S.DTE_MAX):
         return None
+
     for c in ["bid","ask","volume","open_interest","delta","strike"]:
         if c in calls.columns:
             calls[c] = pd.to_numeric(calls[c], errors="coerce")
+    # positive, nonzero, sane spread
     calls = calls[(calls["bid"] > 0) & (calls["ask"] > 0) & (calls["ask"] >= calls["bid"])]
     if calls.empty: return None
+
     calls["mid"] = (calls["bid"] + calls["ask"]) / 2.0
+    calls = calls[calls["mid"] > 0.01]
     calls["spr"] = (calls["ask"] - calls["bid"]) / calls["mid"].clip(1e-9)
+
+    # Liquidity + spread + delta band (tightened)
     calls = calls[
         (calls["open_interest"] >= S.OI_MIN) &
         (calls["volume"] >= S.VOL_MIN) &
@@ -393,9 +410,12 @@ def pick_call_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
         (calls["delta"].between(S.DELTA_MIN, S.DELTA_MAX))
     ]
     if calls.empty: return None
-    target = 0.5*(S.DELTA_MIN + S.DELTA_MAX)
-    calls["drank"] = (calls["delta"] - target).abs()
-    best = calls.sort_values(by=["drank","spr","mid"], ascending=[True,True,False]).iloc[0]
+
+    # Rank around target delta; favor tighter spread and better mid/oi
+    target = 0.5*(S.DELTA_MIN + S.DELTA_MAX)  # ~ +0.70
+    calls["drank"] = (calls["delta"] - target) ** 2
+    best = calls.sort_values(by=["drank","spr","mid","open_interest"], ascending=[True,True,False,False]).iloc[0]
+
     return Pick(t, str(best.get("symbol")), exp, float(best["strike"]), float(best["bid"]),
                 float(best["ask"]), float(best["mid"]), float(best["delta"]), dte)
 
@@ -404,18 +424,24 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
     hist = tradier_history_daily(t, 420)
     if hist.empty: return
     spot = float(hist["Close"].iloc[-1])
-    atr_val = float(atr(hist, S.ATR_LEN).iloc[-1])
+
+    # Robust ATR handling
+    atr_series = atr(hist, S.ATR_LEN)
+    atr_val = float(atr_series.dropna().iloc[-1]) if atr_series.notna().any() else None
+
     picks = [p for p in db_all() if p["ticker"] == t]
     for p in picks:
         hi = max(p["highest_close"], spot)
-        trail = chandelier(hi, atr_val)
+        trail = chandelier(hi, atr_val) if atr_val is not None else p["trail"]
         q = tradier_quote(p["contract"]) or {}
         bid, ask = float(q.get("bid",0)), float(q.get("ask",0))
         mid = (bid + ask)/2 if bid>0 and ask>0 else p["entry_option"]
         peak = max(p["peak_option"], mid)
         reason = None
-        if spot < trail: reason = "trail"
-        elif mid <= peak*(1 - S.OPT_DD): reason = "drawdown"
+        if atr_val is not None and spot < trail: 
+            reason = "trail"
+        elif mid <= peak*(1 - S.OPT_DD): 
+            reason = "drawdown"
         else:
             try: exp_dt = datetime.fromisoformat(p["expiry"])
             except Exception: exp_dt = datetime.strptime(p["expiry"], "%Y-%m-%d")
@@ -436,21 +462,28 @@ def process_candidate_tradier(t: str, cnt: Dict[str,int]):
         if DEBUG: print(f"[SKIP] {t}: no Tradier history")
         return
     spot = float(hist["Close"].iloc[-1])
-    atr_val = float(atr(hist, S.ATR_LEN).iloc[-1])
+
+    # ATR/trail at entry if available
+    atr_series = atr(hist, S.ATR_LEN)
+    atr_val = float(atr_series.dropna().iloc[-1]) if atr_series.notna().any() else None
+
     exps = tradier_expirations(t)
     if not exps:
         if DEBUG: print(f"[SKIP] {t}: no expirations")
         return
     today = datetime.now(UTC)
-    best = None
+    target_dte = (S.DTE_MIN + S.DTE_MAX) // 2
+
+    scored: List[tuple] = []
     for exp in exps:
         cand = pick_call_from_chain(t, exp, today)
         if cand:
-            best = cand
-            break
-    if not best:
+            scored.append((abs(cand.dte - target_dte), cand))
+    if not scored:
         if DEBUG: print(f"[NO OPTIONS] {t}: no viable calls in window")
         return
+
+    best = min(scored, key=lambda x: x[0])[1]
 
     # --------- prevent duplicates across runs ---------
     if already_holding(t, best.contract):
@@ -474,10 +507,11 @@ def screen_symbol(sym: str) -> bool:
     passed = trend_ok(df)
     if DEBUG:
         if passed:
-            r = rsi(df["Close"], S.RSI_LEN).iloc[-1]
+            r = rsi(df["Close"], S.RSI_LEN).dropna()
+            r_last = float(r.iloc[-1]) if len(r) else float('nan')
             ef = ema(df["Close"], S.EMA_FAST).iloc[-1]
             es = ema(df["Close"], S.EMA_SLOW).iloc[-1]
-            print(f"[PASS] {sym}: EMA{S.EMA_FAST}={ef:.2f}>EMA{S.EMA_SLOW}={es:.2f}, RSI={r:.1f}")
+            print(f"[PASS] {sym}: EMA{S.EMA_FAST}={ef:.2f}>EMA{S.EMA_SLOW}={es:.2f}, RSI={r_last:.1f}")
         else:
             print(f"[FAIL] {sym}: trend not confirmed")
     return passed
