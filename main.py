@@ -1,17 +1,18 @@
 # ==========================================================
-# OptionsExecutor Unified v3.0 — S&P 500 (CSV) → Alpaca Screener → Tradier Options
+# OptionsExecutor Unified v3.1 (Audit+) — S&P 500 → Alpaca Screener → Tradier Options
 # - Unifies CALL (bullish) and PUT (bearish) executors into one process
 # - Universe: S&P 500 list via CSV mirrors (no lxml). Small fallback list if mirrors fail.
-# - Screeners:
-#     * Bullish (calls): EMA20>EMA50, RSI rising 50-70, price ≤ +5% of EMA20
-#     * Bearish (puts):  EMA20<EMA50, RSI falling 30-50, price ≥ -5% below EMA20
-# - Options (Tradier): greeks flattened; spread / OI / Vol / delta filters
-# - Exits: fixed stop-loss & take-profit on option premium, ATR chandelier (bullish or bearish),
-#          peak drawdown, and DTE-based time exit.
-# - Duplicate protection: avoid duplicates via local DB + Tradier positions
-# - Market-hours gating: skip new buys outside RTH by default (holiday-aware via Tradier)
-# - Strategy selection via STRATEGY env: 'calls' | 'puts' | 'both' (default: both)
-# - DB schema unified for both legs; safe to reuse if table exists (adds cols when missing)
+# - Screeners (enhanced):
+#     * Bullish (calls): 20EMA>50SMA, RSI reversal up (cross >50), MACD crossover or rising hist,
+#                        volume spike + green candle, support confirmation, price ≤ +5% of EMA20.
+#     * Bearish (puts):  20EMA<50SMA, RSI reversal down (cross <50), MACD cross down or falling hist,
+#                        volume spike + red candle, resistance confirmation, price ≥ -5% below EMA20.
+# - Options (Tradier): greeks, spread, OI, Vol, delta ranges, IV percentile filter, theta cap (Δ+θ balance)
+# - Exits: fixed stop-loss/target on premium, ATR chandelier (per-leg), peak drawdown, DTE-based exit
+# - Duplicate protection: local DB + Tradier positions
+# - Market-hours gating (holiday-aware via Tradier)
+# - Strategy selection: STRATEGY env: 'calls'|'puts'|'both' (default both)
+# - AUDIT: rich console summaries when candidates pass and when orders are placed
 # ==========================================================
 
 import os, json, sqlite3, time, requests, pandas as pd
@@ -84,6 +85,15 @@ class S:
     # --- Logging ---
     VERBOSE = _b("VERBOSE", True)
 
+    # --- Volatility & greeks filters ---
+    IV_PCTL_MAX      = _f("IV_PCTL_MAX", 0.60)        # only take if IV percentile ≤ 60th within expiry/leg
+    THETA_MAX_DAILY  = _f("THETA_MAX_DAILY", 0.0125)  # abs(theta) per day ≤ 1.25% of option price (approx)
+
+    # --- Volume / support ---
+    VOL_SPIKE_MULT   = _f("VOL_SPIKE_MULT", 1.20)     # last vol ≥ 1.2 × 10d average
+    SUPPORT_LOOKBACK = _i("SUPPORT_LOOKBACK", 20)     # N-day rolling low/high for support/resistance
+    SUPPORT_BAND_PCT = _f("SUPPORT_BAND_PCT", 0.03)   # within 3% of support/resistance band
+
 DEBUG = os.getenv("DEBUG", "false").lower() in ("1","true","yes")
 
 # -------------------- HTTP helpers --------------------
@@ -93,7 +103,7 @@ def _alpaca_headers():
         "APCA-API-KEY-ID": S.ALPACA_KEY,
         "APCA-API-SECRET-KEY": S.ALPACA_SECRET,
         "Accept": "application/json",
-        "User-Agent": "OptionsExecutor/3.0 (+Unified)"
+        "User-Agent": "OptionsExecutor/3.1 (+Unified)"
     }
 
 def _alpaca_get(path, params=None):
@@ -111,7 +121,7 @@ def _tradier_headers():
     return {
         "Authorization": f"Bearer {S.TRADIER_TOKEN}",
         "Accept": "application/json",
-        "User-Agent": "OptionsExecutor/3.0"
+        "User-Agent": "OptionsExecutor/3.1"
     }
 
 def _tradier_get(path, params=None):
@@ -203,38 +213,126 @@ def chandelier_bull(high, atrv):
 def chandelier_bear(low, atrv):
     return low + S.TRAIL_K * atrv if atrv is not None else low
 
+def macd(series, fast=12, slow=26, signal=9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    line = ema_fast - ema_slow
+    sig  = line.ewm(span=signal, adjust=False).mean()
+    hist = line - sig
+    return line, sig, hist
+
+def crossed_above(a_now, a_prev, b_now, b_prev):
+    return a_prev <= b_prev and a_now > b_now
+
+def rsi_reversal_ok(c, n=14):
+    r = rsi(c, n).dropna()
+    if len(r) < 3: return False
+    r_last, r_prev = float(r.iloc[-1]), float(r.iloc[-2])
+    return r_prev <= 50.0 and r_last > 50.0 and r_last > r_prev
+
+def volume_spike_green(df):
+    v = df["Volume"].astype(float)
+    if len(v) < 12: return False
+    v10 = v.rolling(10).mean().iloc[-1]
+    last_vol = v.iloc[-1]
+    last_green = float(df["Close"].iloc[-1]) > float(df["Open"].iloc[-1])
+    return last_green and (last_vol >= S.VOL_SPIKE_MULT * v10)
+
+def support_confirmation(df):
+    """Price within SUPPORT_BAND_PCT above N-day low, and closing higher vs yesterday."""
+    c = df["Close"].astype(float)
+    l = df["Low"].astype(float)
+    if len(c) < max(3, S.SUPPORT_LOOKBACK + 1): return False
+    rolling_low = l.rolling(S.SUPPORT_LOOKBACK).min().iloc[-1]
+    last_close, prev_close = float(c.iloc[-1]), float(c.iloc[-2])
+    near_support = (last_close - rolling_low) / max(1e-9, last_close) <= S.SUPPORT_BAND_PCT
+    higher_close = last_close > prev_close
+    return near_support and higher_close
+
 # -------------------- Screeners --------------------
 
 def trend_bull_ok(df):
-    """Bullish health check: EMA20>EMA50; RSI rising 50-70; price not >5% above EMA20."""
-    need = max(S.EMA_SLOW + 5, S.RSI_LEN + 5)
+    """
+    Bullish health check (enhanced):
+      - 20EMA > 50SMA (trend bias)
+      - RSI reversal up (cross > 50 & rising)
+      - MACD crossover (line>signal) OR histogram rising
+      - Volume spike + green candle
+      - Support confirmation (near N-day low, bouncing)
+      - Price not > +5% above EMA20 (avoid chasing)
+    """
+    need = max(S.EMA_SLOW + 10, S.RSI_LEN + 10, 60)
     if df.empty or len(df) < need: return False
     c = df["Close"].astype(float)
-    ef, es = ema(c, S.EMA_FAST), ema(c, S.EMA_SLOW)
-    r = rsi(c, S.RSI_LEN).dropna()
-    if len(r) < 2: return False
-    r_last, r_prev = float(r.iloc[-1]), float(r.iloc[-2])
+    ef = ema(c, S.EMA_FAST); es = ema(c, S.EMA_SLOW)
+    if not (ef.iloc[-1] > es.iloc[-1]):  # trend bias
+        return False
+    if not rsi_reversal_ok(c, S.RSI_LEN):
+        return False
+    macd_line, macd_sig, macd_hist = macd(c)
+    if len(macd_line) < 3: return False
+    macd_ok = crossed_above(macd_line.iloc[-1], macd_line.iloc[-2], macd_sig.iloc[-1], macd_sig.iloc[-2]) \
+              or (macd_hist.iloc[-1] > macd_hist.iloc[-2] > macd_hist.iloc[-3])
+    if not macd_ok:
+        return False
+    if not volume_spike_green(df):
+        return False
+    if not support_confirmation(df):
+        return False
     price = float(c.iloc[-1])
-    if not (ef.iloc[-1] > es.iloc[-1]): return False
-    if not (50.0 < r_last < 70.0): return False
-    if r_last < r_prev: return False
-    if price > float(ef.iloc[-1]) * 1.05: return False
+    if price > float(ef.iloc[-1]) * 1.05:
+        return False
     return True
 
 def trend_bear_ok(df):
-    """Bearish health check: EMA20<EMA50; RSI falling 30-50; price not <95% of EMA20."""
-    need = max(S.EMA_SLOW + 5, S.RSI_LEN + 5)
+    """
+    Bearish health check (inverse):
+      - 20EMA < 50SMA
+      - RSI reversal down (cross < 50 & falling)
+      - MACD cross down OR histogram decreasing
+      - Volume spike + red candle
+      - Resistance confirmation (near N-day high, rolling over)
+      - Price not < -5% under EMA20 (avoid chasing)
+    """
+    need = max(S.EMA_SLOW + 10, S.RSI_LEN + 10, 60)
     if df.empty or len(df) < need: return False
     c = df["Close"].astype(float)
-    ef, es = ema(c, S.EMA_FAST), ema(c, S.EMA_SLOW)
+    ef = ema(c, S.EMA_FAST); es = ema(c, S.EMA_SLOW)
+    if not (ef.iloc[-1] < es.iloc[-1]):
+        return False
+
     r = rsi(c, S.RSI_LEN).dropna()
-    if len(r) < 2: return False
+    if len(r) < 3: return False
     r_last, r_prev = float(r.iloc[-1]), float(r.iloc[-2])
-    price = float(c.iloc[-1])
-    if not (ef.iloc[-1] < es.iloc[-1]): return False
-    if not (30.0 <= r_last < 50.0): return False
-    if r_last > r_prev: return False
-    if price < float(ef.iloc[-1]) * 0.95: return False
+    if not (r_prev >= 50.0 and r_last < 50.0 and r_last < r_prev):
+        return False
+
+    macd_line, macd_sig, macd_hist = macd(c)
+    if len(macd_line) < 3: return False
+    macd_ok = crossed_above(macd_sig.iloc[-1], macd_sig.iloc[-2], macd_line.iloc[-1], macd_line.iloc[-2]) \
+              or (macd_hist.iloc[-1] < macd_hist.iloc[-2] < macd_hist.iloc[-3])
+    if not macd_ok:
+        return False
+
+    v = df["Volume"].astype(float)
+    if len(v) < 12: return False
+    v10 = v.rolling(10).mean().iloc[-1]
+    last_vol = v.iloc[-1]
+    last_red = float(df["Close"].iloc[-1]) < float(df["Open"].iloc[-1])
+    if not (last_red and last_vol >= S.VOL_SPIKE_MULT * v10):
+        return False
+
+    h = df["High"].astype(float)
+    rolling_high = h.rolling(S.SUPPORT_LOOKBACK).max().iloc[-1]
+    last_close, prev_close = float(c.iloc[-1]), float(c.iloc[-2])
+    near_resist = (rolling_high - last_close) / max(1e-9, rolling_high) <= S.SUPPORT_BAND_PCT
+    lower_close = last_close < prev_close
+    if not (near_resist and lower_close):
+        return False
+
+    if float(c.iloc[-1]) < float(ef.iloc[-1]) * 0.95:
+        return False
+
     return True
 
 # -------------------- DB --------------------
@@ -261,7 +359,6 @@ def db_init():
         )
         """
     )
-    # migrations for older tables
     for col in [
         ("option_type", "ALTER TABLE picks ADD COLUMN option_type TEXT"),
         ("highest_close", "ALTER TABLE picks ADD COLUMN highest_close REAL"),
@@ -269,17 +366,13 @@ def db_init():
         ("trail_bull", "ALTER TABLE picks ADD COLUMN trail_bull REAL"),
         ("trail_bear", "ALTER TABLE picks ADD COLUMN trail_bear REAL"),
     ]:
-        try:
-            con.execute(col[1])
-        except Exception:
-            pass
+        try: con.execute(col[1])
+        except Exception: pass
     con.commit(); con.close()
-
 
 def db_all():
     con = sqlite3.connect(S.DB); con.row_factory = sqlite3.Row
     rows = [dict(r) for r in con.execute("SELECT * FROM picks")] ; con.close(); return rows
-
 
 def db_add(row):
     con = sqlite3.connect(S.DB)
@@ -294,7 +387,6 @@ def db_add(row):
     )
     con.commit(); con.close()
 
-
 def db_upd(contract, highest_close, lowest_close, trail_bull, trail_bear, peak_option):
     con = sqlite3.connect(S.DB)
     con.execute(
@@ -302,7 +394,6 @@ def db_upd(contract, highest_close, lowest_close, trail_bull, trail_bear, peak_o
         (highest_close, lowest_close, trail_bull, trail_bear, peak_option, contract),
     )
     con.commit(); con.close()
-
 
 def db_del(contract):
     con = sqlite3.connect(S.DB)
@@ -322,7 +413,7 @@ _SP500_SOURCES = [
 
 def sp500_symbols() -> List[str]:
     sess = requests.Session()
-    sess.headers.update({"User-Agent": "Mozilla/5.0 OptionsExecutor/3.0"})
+    sess.headers.update({"User-Agent": "Mozilla/5.0 OptionsExecutor/3.1"})
     for src in _SP500_SOURCES:
         try:
             r = sess.get(src, timeout=30); r.raise_for_status()
@@ -355,11 +446,10 @@ def alpaca_history_daily_symbol(symbol: str, days: int = 420) -> pd.DataFrame:
     df = pd.DataFrame(bars)
     if df.empty: return pd.DataFrame()
     df["date"] = pd.to_datetime(df["t"])
-    df = df.rename(columns={"h":"High","l":"Low","c":"Close","v":"Volume"})
-    for c in ("High","Low","Close","Volume"):
+    df = df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","v":"Volume"})
+    for c in ("Open","High","Low","Close","Volume"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df[["date","High","Low","Close","Volume"]].set_index("date").sort_index()
-
+    return df[["date","Open","High","Low","Close","Volume"]].set_index("date").sort_index()
 
 def tradier_history_daily(symbol: str, days: int = 420) -> pd.DataFrame:
     start = (datetime.now(UTC) - timedelta(days=days+10)).date().isoformat()
@@ -369,14 +459,13 @@ def tradier_history_daily(symbol: str, days: int = 420) -> pd.DataFrame:
     df = pd.DataFrame(h); df["date"] = pd.to_datetime(df["date"])
     for c in ["open","high","low","close","volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.rename(columns={"high":"High","low":"Low","close":"Close","volume":"Volume"}).set_index("date").sort_index()
-
+    df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+    return df[["date","Open","High","Low","Close","Volume"]].set_index("date").sort_index()
 
 def tradier_expirations(sym: str) -> List[str]:
     d = _tradier_get("/v1/markets/options/expirations", {"symbol": sym, "includeAllRoots":"true", "strikes":"false"})
     e = (d.get("expirations") or {}).get("date")
     return e if isinstance(e, list) else ([e] if e else [])
-
 
 def tradier_chain(sym: str, exp: str) -> pd.DataFrame:
     d = _tradier_get("/v1/markets/options/chains", {"symbol": sym, "expiration": exp, "greeks":"true"})
@@ -396,18 +485,15 @@ def tradier_chain(sym: str, exp: str) -> pd.DataFrame:
         df["iv"]    = pd.to_numeric(g.apply(lambda x: x.get("mid_iv") if "mid_iv" in x else x.get("bid_iv") if "bid_iv" in x else x.get("ask_iv")), errors="coerce")
     return df
 
-
 def tradier_quote(sym_occ: str) -> Dict:
     d = _tradier_get("/v1/markets/quotes", {"symbols": sym_occ})
     return (d.get("quotes") or {}).get("quote") or {}
-
 
 def tradier_positions() -> List[Dict]:
     if not S.TRADIER_ACCOUNT: return []
     d = _tradier_get(f"/v1/accounts/{S.TRADIER_ACCOUNT}/positions")
     p = (d.get("positions") or {}).get("position")
     return p if isinstance(p, list) else ([p] if p else [])
-
 
 def tradier_order(underlying: str, occ_symbol: str, side: str, qty: int, otype="limit", price=None, preview=False):
     if S.DRY_RUN:
@@ -446,7 +532,6 @@ def has_open_pick_in_db(ticker: str, occ: Optional[str] = None) -> bool:
         r = con.execute("SELECT 1 FROM picks WHERE ticker=?", (ticker,)).fetchone()
     con.close(); return r is not None
 
-
 def has_tradier_position(ticker: str, occ: Optional[str] = None) -> bool:
     try: poss = tradier_positions()
     except Exception: return False
@@ -460,7 +545,6 @@ def has_tradier_position(ticker: str, occ: Optional[str] = None) -> bool:
             if und == ticker or sym == ticker or sym.split(' ')[0] == ticker: return True
     return False
 
-
 def already_holding(ticker: str, occ: str) -> bool:
     return has_open_pick_in_db(ticker) or has_open_pick_in_db(ticker, occ) or \
            has_tradier_position(ticker) or has_tradier_position(ticker, occ)
@@ -469,8 +553,29 @@ def already_holding(ticker: str, occ: str) -> bool:
 
 @dataclass
 class Pick:
-    ticker: str; contract: str; expiry: str; strike: float; bid: float; ask: float; mid: float; delta: float; dte: int; option_type: str
+    ticker: str
+    contract: str
+    expiry: str
+    strike: float
+    bid: float
+    ask: float
+    mid: float
+    delta: float
+    dte: int
+    option_type: str
+    oi: int
+    vol: int
+    iv: float
+    iv_pctl: float
+    theta_abs: float
+    vega: float
+    gamma: float
+    spr: float
 
+def _percentile_series(series: pd.Series) -> pd.Series:
+    s = series.astype(float)
+    s_sorted = s.sort_values()
+    return s_sorted.rank(pct=True).reindex(series.index).fillna(1.0)
 
 def pick_from_chain(t: str, exp: str, today: datetime, option_type: str) -> Optional[Pick]:
     df = tradier_chain(t, exp)
@@ -486,39 +591,98 @@ def pick_from_chain(t: str, exp: str, today: datetime, option_type: str) -> Opti
     dte = max(0, (exp_dt.date() - today.date()).days)
     if not (S.DTE_MIN <= dte <= S.DTE_MAX): return None
 
-    for c in ["bid","ask","volume","open_interest","delta","strike"]:
+    for c in ["bid","ask","volume","open_interest","delta","strike","theta","iv","vega","gamma"]:
         if c in leg.columns: leg[c] = pd.to_numeric(leg[c], errors="coerce")
-    leg = leg[(leg["bid"] > 0) & (leg["ask"] > 0) & (leg["ask"] >= leg["bid"]) ]
+    leg = leg[(leg["bid"] > 0) & (leg["ask"] > 0) & (leg["ask"] >= leg["bid"])]
     if leg.empty: return None
 
     leg["mid"] = (leg["bid"] + leg["ask"]) / 2.0
     leg = leg[leg["mid"] > 0.01]
     leg["spr"] = (leg["ask"] - leg["bid"]) / leg["mid"].clip(1e-9)
 
+    # IV percentile within expiry/leg snapshot
+    if "iv" in leg.columns:
+        leg["iv_pctl"] = _percentile_series(leg["iv"])
+    else:
+        leg["iv_pctl"] = 0.50
+
+    leg["theta_abs"] = leg["theta"].abs().fillna(0)
+
     if option_type == "call":
         leg = leg[
             (leg["open_interest"] >= S.OI_MIN) &
             (leg["volume"] >= S.VOL_MIN) &
             (leg["spr"] <= S.MAX_SPREAD) &
-            (leg["delta"].between(S.CALL_DELTA_MIN, S.CALL_DELTA_MAX))
+            (leg["delta"].between(S.CALL_DELTA_MIN, S.CALL_DELTA_MAX)) &
+            (leg["iv_pctl"] <= S.IV_PCTL_MAX) &
+            (leg["theta_abs"] <= S.THETA_MAX_DAILY)
         ]
-        target = 0.5 * (S.CALL_DELTA_MIN + S.CALL_DELTA_MAX)  # ~ +0.70
+        target = 0.5 * (S.CALL_DELTA_MIN + S.CALL_DELTA_MAX)
     else:
         leg = leg[
             (leg["open_interest"] >= S.OI_MIN) &
             (leg["volume"] >= S.VOL_MIN) &
             (leg["spr"] <= S.MAX_SPREAD) &
-            (leg["delta"].between(S.PUT_DELTA_MIN, S.PUT_DELTA_MAX))
+            (leg["delta"].between(S.PUT_DELTA_MIN, S.PUT_DELTA_MAX)) &
+            (leg["iv_pctl"] <= S.IV_PCTL_MAX) &
+            (leg["theta_abs"] <= S.THETA_MAX_DAILY)
         ]
-        target = 0.5 * (S.PUT_DELTA_MIN + S.PUT_DELTA_MAX)   # ~ -0.70
+        target = 0.5 * (S.PUT_DELTA_MIN + S.PUT_DELTA_MAX)
 
     if leg.empty: return None
 
     leg["drank"] = (leg["delta"] - target) ** 2
     best = leg.sort_values(by=["drank","spr","mid","open_interest"], ascending=[True,True,False,False]).iloc[0]
 
-    return Pick(t, str(best.get("symbol")), exp, float(best["strike"]), float(best["bid"]),
-                float(best["ask"]), float(best["mid"]), float(best["delta"]), dte, option_type)
+    return Pick(
+        t, str(best.get("symbol")), exp, float(best["strike"]),
+        float(best["bid"]), float(best["ask"]), float(best["mid"]),
+        float(best["delta"]), dte, option_type,
+        int(best.get("open_interest", 0)), int(best.get("volume", 0)),
+        float(best.get("iv", float("nan"))), float(best.get("iv_pctl", 1.0)),
+        float(best.get("theta_abs", float("nan"))),
+        float(best.get("vega", float("nan"))), float(best.get("gamma", float("nan"))),
+        float(best.get("spr", float("nan")))
+    )
+
+# -------------------- AUDIT / SUMMARIES --------------------
+
+def audit_symbol_snapshot(sym: str, df: pd.DataFrame) -> Dict[str, float]:
+    """Compute key technical facts for audit printing."""
+    c = df["Close"].astype(float)
+    ef, es = ema(c, S.EMA_FAST), ema(c, S.EMA_SLOW)
+    price = float(c.iloc[-1])
+    r = rsi(c, S.RSI_LEN).dropna()
+    r_last = float(r.iloc[-1]) if len(r) else float("nan")
+    m_line, m_sig, m_hist = macd(c)
+    macd_cross_up = crossed_above(m_line.iloc[-1], m_line.iloc[-2], m_sig.iloc[-1], m_sig.iloc[-2])
+    macd_hist_rise = (len(m_hist) >= 3) and (m_hist.iloc[-1] > m_hist.iloc[-2] > m_hist.iloc[-3])
+    vol_ok = volume_spike_green(df)
+    supp_ok = support_confirmation(df)
+    atr_series = atr(df, S.ATR_LEN)
+    atr_val = float(atr_series.dropna().iloc[-1]) if atr_series.notna().any() else float("nan")
+    return {
+        "price": price,
+        f"EMA{S.EMA_FAST}": float(ef.iloc[-1]),
+        f"EMA{S.EMA_SLOW}": float(es.iloc[-1]),
+        "RSI": r_last,
+        "MACD_cross_up": bool(macd_cross_up),
+        "MACD_hist_rise": bool(macd_hist_rise),
+        "VolumeGreen": bool(vol_ok),
+        "SupportOK": bool(supp_ok),
+        "ATR": atr_val
+    }
+
+def print_pick_summary(stage: str, pick: Pick, sym_stats: Dict[str, float]):
+    """Pretty console summary per pick."""
+    head = f"[{stage}] {pick.option_type.upper()} {pick.ticker} {pick.contract}"
+    tech = f"Price={sym_stats['price']:.2f}  EMA{S.EMA_FAST}={sym_stats[f'EMA{S.EMA_FAST}']:.2f}  EMA{S.EMA_SLOW}={sym_stats[f'EMA{S.EMA_SLOW}']:.2f}  RSI={sym_stats['RSI']:.1f}  ATR={sym_stats['ATR']:.2f}"
+    signals = f"Signals: MACD_cross_up={sym_stats['MACD_cross_up']} hist_rise={sym_stats['MACD_hist_rise']} VolGreen={sym_stats['VolumeGreen']} SupportOK={sym_stats['SupportOK']}"
+    opt = f"Opt: DTE={pick.dte} Δ={pick.delta:.2f} mid={pick.mid:.2f} bid/ask={pick.bid:.2f}/{pick.ask:.2f} spr={pick.spr:.2%} OI={pick.oi} Vol={pick.vol} IV={pick.iv:.3f} IVpctl={pick.iv_pctl:.2f} | |θ|={pick.theta_abs:.4f} vega={pick.vega:.4f} γ={pick.gamma:.4f}"
+    print(head)
+    print("  " + tech)
+    print("  " + signals)
+    print("  " + opt)
 
 # -------------------- Exits / management --------------------
 
@@ -526,7 +690,7 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
     hist = tradier_history_daily(t, 420)
     if hist.empty: return
     spot = float(hist["Close"].iloc[-1])
-    hi = float(hist["Close"].rolling(2).max().iloc[-1])  # quick stab if highest_close missing
+    hi = float(hist["Close"].rolling(2).max().iloc[-1])
     lo = float(hist["Close"].rolling(2).min().iloc[-1])
 
     atr_series = atr(hist, S.ATR_LEN)
@@ -546,18 +710,15 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
         trail_bear = chandelier_bear(lowest_close,  atr_val) if atr_val is not None else p.get("trail_bear", spot)
 
         reason=None
-        # hard stops / targets on premium
         if mid <= p["entry_option"] * (1 - S.STOP_LOSS):
             reason = "stoploss"
         elif mid >= p["entry_option"] * (1 + S.TAKE_PROFIT):
             reason = "target"
         else:
-            # chandelier per leg
             if option_type == "call" and atr_val is not None and spot < trail_bull:
                 reason = "trail_bull_break"
             elif option_type == "put" and atr_val is not None and spot > trail_bear:
                 reason = "trail_bear_break"
-            # peak drawdown on option
             elif mid <= peak*(1 - S.OPT_DD):
                 reason = "drawdown"
             else:
@@ -586,7 +747,6 @@ def process_candidate_tradier(t: str, option_type: str, cnt: Dict[str,int]):
     if hist.empty:
         if DEBUG: print(f"[SKIP] {t}: no Tradier history"); return
     spot = float(hist["Close"].iloc[-1])
-
     atr_series = atr(hist, S.ATR_LEN)
     atr_val = float(atr_series.dropna().iloc[-1]) if atr_series.notna().any() else None
 
@@ -604,10 +764,17 @@ def process_candidate_tradier(t: str, option_type: str, cnt: Dict[str,int]):
     if not scored:
         if DEBUG: print(f"[NO {option_type.upper()}] {t}: no viable options"); return
 
-    best = min(scored, key=lambda x: x[0])[1]
+    best: Pick = min(scored, key=lambda x: x[0])[1]
+
+    # symbol audit snapshot
+    sym_stats = audit_symbol_snapshot(t, hist)
+
+    # pre-entry audit print
+    print_pick_summary("CANDIDATE", best, sym_stats)
 
     if already_holding(t, best.contract):
-        print(f"[SKIP] {t}: already holding {t} / {best.contract}"); return
+        print(f"[SKIP] {t}: already holding {t} / {best.contract}")
+        return
 
     cnt["viable"] += 1
     limit = round(min(best.ask, best.mid * 1.02), 2)
@@ -625,26 +792,32 @@ def process_candidate_tradier(t: str, option_type: str, cnt: Dict[str,int]):
             spot, best.mid, hi, lo, trail_bull, trail_bear, best.mid, datetime.now(UTC).isoformat(), option_type))
     cnt["buys"] += 1
 
+    # post-entry confirmation (helps confirm fill context)
+    print_pick_summary("ENTERED", best, sym_stats)
+
 # -------------------- Screening --------------------
 
 def screen_symbol(sym: str, leg: str) -> bool:
     df = alpaca_history_daily_symbol(sym, 420)
     if df.empty:
         if DEBUG: print(f"[SKIP] {sym}: no bars"); return False
-    if leg == "call":
-        passed = trend_bull_ok(df)
-    else:
-        passed = trend_bear_ok(df)
+    passed = trend_bull_ok(df) if leg == "call" else trend_bear_ok(df)
     if DEBUG:
         c = df["Close"]
         ef = float(ema(c, S.EMA_FAST).iloc[-1])
         es = float(ema(c, S.EMA_SLOW).iloc[-1])
         r = rsi(c, S.RSI_LEN).dropna()
         r_last = float(r.iloc[-1]) if len(r) else float('nan')
-        price = float(c.iloc[-1])
         tag = "PASS" if passed else "FAIL"
-        orient = ">" if leg=="call" else "<"
-        print(f"[{tag}-{leg.upper()}] {sym}: price={price:.2f}, EMA{S.EMA_FAST}={ef:.2f} {orient} EMA{S.EMA_SLOW}={es:.2f}, RSI={r_last:.1f}")
+        extra = []
+        if leg == "call":
+            extra.append(f"RSI_rev={rsi_reversal_ok(c)}")
+            m_line, m_sig, m_hist = macd(c)
+            x = crossed_above(m_line.iloc[-1], m_line.iloc[-2], m_sig.iloc[-1], m_sig.iloc[-2])
+            extra.append(f"MACD_x={bool(x)}")
+            extra.append(f"VolGreen={volume_spike_green(df)}")
+            extra.append(f"Support={support_confirmation(df)}")
+        print(f"[{tag}-{leg.upper()}] {sym}: Close={float(c.iloc[-1]):.2f} | EMA{S.EMA_FAST}={ef:.2f} vs EMA{S.EMA_SLOW}={es:.2f} | RSI={r_last:.1f} | {' '.join(extra)}")
     return passed
 
 # -------------------- Runner --------------------
@@ -662,9 +835,7 @@ def sanity_check_tradier():
         except Exception as e:
             print("[CHECK] account error:", e)
 
-
 def run_once():
-    # Validate env
     miss=[]
     if not S.ALPACA_KEY or not S.ALPACA_SECRET: miss.append("APCA_API_KEY_ID/APCA_API_SECRET_KEY")
     if not S.TRADIER_TOKEN: miss.append("TRADIER_TOKEN")
@@ -675,11 +846,11 @@ def run_once():
     strat = S.STRATEGY if S.STRATEGY in ("calls","puts","both") else "both"
     print(f"[ENV] Strategy={strat} | Alpaca feed={S.ALPACA_FEED} base={S.ALPACA_DATA_BASE}")
     print(f"[ENV] Exits: STOP_LOSS={S.STOP_LOSS:.2%}, TAKE_PROFIT={S.TAKE_PROFIT:.2%}, PEAK_DD={S.OPT_DD:.2%}, DTE_STOP={S.DTE_STOP}d")
+    print(f"[ENV] Entry guards: IV_PCTL_MAX={S.IV_PCTL_MAX:.0%}, |θ|≤{S.THETA_MAX_DAILY:.2%}/day, VOL_SPIKE×{S.VOL_SPIKE_MULT:.2f}, SUPPORT_LOOKBACK={S.SUPPORT_LOOKBACK}, SUPPORT_BAND={S.SUPPORT_BAND_PCT:.1%}")
 
     db_init()
     sanity_check_tradier()
 
-    # Universe
     syms = sp500_symbols()
     print(f"[INFO] Universe: S&P 500 symbols={len(syms)}")
 
@@ -717,8 +888,7 @@ def run_once():
         except Exception as e:
             print(f"[ERR][manage] {t}: {e}")
 
-    print(f"[SUMMARY] candidates={(cnt['viable']+0)} viable={cnt['viable']} buys={cnt['buys']} sells={cnt['sells']}")
-
+    print(f"[SUMMARY] viable={cnt['viable']} buys={cnt['buys']} sells={cnt['sells']}")
 
 if __name__ == "__main__":
     run_once()
